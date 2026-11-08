@@ -16,6 +16,14 @@ duplicate *cards within a layout* are rejected. Bitmask input cannot represent a
 duplicate occurrence within one holding; a list/PBN adapter must detect that
 before conversion if it accepts noncanonical input.
 
+The default `Automatic` mode uses native TT retention through 256 layouts,
+except that positions with at most seven remaining tricks enable root
+certificates from 64 layouts. It adds shape ordering above 256 layouts. This is a conservative
+empirical policy, not a proven optimal crossover. Select `Cold`, `Retained` or
+`RootProofs` explicitly to override it and control `sort_by_shape` yourself.
+Requesting experimental cash bounds in Automatic mode also enables the root
+driver for smaller batches; cash bounds are off by default.
+
 Each batch owns a fresh context, retains its transposition table with DDS mode 2,
 and destroys that context at completion. Keeping a single strain for that
 lifetime matters: DDS mode 2 suppresses its ordinary new-trump reset as well as
