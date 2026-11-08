@@ -1,0 +1,889 @@
+diff --git a/benchmarks/BUILD.bazel b/benchmarks/BUILD.bazel
+index 018a76f..db3ed69 100644
+--- a/benchmarks/BUILD.bazel
++++ b/benchmarks/BUILD.bazel
+@@ -100,3 +100,18 @@ cc_test(
+         "@googletest//:gtest_main",
+     ],
+ )
++
++cc_test(
++    name = "related_batch_test",
++    srcs = ["related_batch_test.cpp"],
++    copts = DDS_CPPOPTS,
++    linkopts = DDS_LINKOPTS,
++    deps = ["//library/src:dds", "@googletest//:gtest_main"],
++)
++cc_binary(
++    name = "related_batch_benchmark",
++    srcs = ["related_batch_benchmark.cpp"],
++    copts = DDS_CPPOPTS,
++    linkopts = DDS_LINKOPTS,
++    deps = ["//library/src:dds"],
++)
+diff --git a/benchmarks/related_batch_benchmark.cpp b/benchmarks/related_batch_benchmark.cpp
+new file mode 100644
+index 0000000..a7090f7
+--- /dev/null
++++ b/benchmarks/related_batch_benchmark.cpp
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <related_batch.hpp>
++#include <algorithm>
++#include <bit>
++#include <fstream>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <set>
++#include <stdexcept>
++#include <string>
++using namespace related_batch;
++namespace {
++auto make_family(int cards,int count,unsigned seed,int trump,int constraint) -> Batch
++{
++    std::mt19937 rng(seed); std::array<int,52> deck{};
++    std::iota(deck.begin(),deck.end(),0); std::shuffle(deck.begin(),deck.end(),rng);
++    Batch b; b.trump=trump; b.first=3; std::vector<int> ew;
++    Defenders fixed{}; int need_e=cards;
++    for(int i=0;i<cards;++i) {
++        int n=deck[i],s=deck[13+i]; b.north[n/13]|=1u<<(n%13+2); b.south[s/13]|=1u<<(s%13+2);
++        for(int h=2;h<4;++h) {
++            int c=deck[13*h+i];
++            if(constraint==2&&c%13>=8) {
++                (h==2?fixed.east:fixed.west)[c/13]|=1u<<(c%13+2);
++                if(h==2) --need_e;
++            } else ew.push_back(c);
++        }
++    }
++    std::array<int,4> base_shape{}; int base_hcp=0;
++    for(int i=0;i<cards;++i) {int c=deck[26+i];++base_shape[c/13];base_hcp+=std::max(0,c%13-8);}
++    std::set<std::array<unsigned,4>> seen;
++    std::uint64_t capacity = 1;
++    for(int i=1;i<=need_e;++i) capacity=capacity*(ew.size()-i+1)/i;
++    if(static_cast<std::uint64_t>(count)>capacity)
++        throw std::invalid_argument("requested more distinct layouts than the E/W pool permits");
++    unsigned attempts=0;
++    while(static_cast<int>(b.layouts.size())<count) {
++        if(++attempts>1000000)
++            throw std::runtime_error("constraint rejection limit reached; request fewer layouts");
++        std::shuffle(ew.begin(),ew.end(),rng); Defenders d=fixed;
++        for(std::size_t i=0;i<ew.size();++i) (static_cast<int>(i)<need_e?d.east:d.west)[ew[i]/13]|=1u<<(ew[i]%13+2);
++        if(constraint==1) {
++            int hcp=0; bool fits=true;
++            for(int s=0;s<4;++s) {
++                if(std::abs(std::popcount(d.east[s])-base_shape[s])>1) fits=false;
++                for(int r=11;r<=14;++r) if(d.east[s]&(1u<<r)) hcp+=r-10;
++            }
++            if(!fits||std::abs(hcp-base_hcp)>2) continue;
++        }
++        if(!seen.insert(d.east).second) continue;
++        b.layouts.push_back(d);
++    }
++    validate(b); return b;
++}
++}
++auto main(int argc,char** argv) -> int
++{
++    const int families=argc>1?std::stoi(argv[1]):4, count=argc>2?std::stoi(argv[2]):1000;
++    const int repeats=argc>3?std::stoi(argv[3]):3,cards=argc>4?std::stoi(argv[4]):13;
++    const unsigned base=argc>5?std::stoul(argv[5]):20261118;
++    const std::string prefix=argc>6?argv[6]:"batch";
++    const int selected_constraint=argc>7?std::stoi(argv[7]):-1;
++    const int variants=argc>8?std::stoi(argv[8]):5;
++    if(cards<1||cards>13||count<1||families<1||repeats<1||selected_constraint<-1||selected_constraint>2||variants<5||variants>6)
++        throw std::invalid_argument("invalid benchmark parameters");
++    std::ofstream hands(prefix+"_hands.csv"), scores(prefix+"_scores.csv");
++    hands<<"family,constraint,index,trump,first"; for(int h=0;h<4;++h) for(int s=0;s<4;++s) hands<<",h"<<h<<"s"<<s; hands<<'\n';
++    scores<<"family,constraint,index,ns_tricks\n";
++    std::cout<<"family,constraint,cards,size,repeat,variant,total_ms,validation_ms,nodes,tt_lookups,tt_hits,root_full,root_partial,root_proofs,root_checks,shape_bound_hits,tt_mib\n";
++    for(int fi=0;fi<families;++fi) for(int constraint=0;constraint<3;++constraint) {
++        if(selected_constraint>=0&&constraint!=selected_constraint) continue;
++        auto all=make_family(cards,count,base+fi,fi%5,constraint);
++        for(int i=0;i<count;++i) {auto dl=make_deal(all,i);hands<<fi<<','<<constraint<<','<<i<<','<<all.trump<<','<<all.first;
++            for(auto& h:dl.remainCards) { for(auto c:h) hands<<','<<c; }
++            hands<<'\n';}
++        hands.flush();
++        std::vector<int> sizes={1,4,16,64,256,count}; std::sort(sizes.begin(),sizes.end()); sizes.erase(std::unique(sizes.begin(),sizes.end()),sizes.end());
++        for(int size:sizes) {if(size>count) continue;auto b=all;b.layouts.resize(size);std::vector<int> ref;
++            for(int rep=0;rep<repeats;++rep) {
++                std::vector<int> modes(variants);std::iota(modes.begin(),modes.end(),0);if(rep%2)std::reverse(modes.begin(),modes.end());
++                for(int variant:modes) {
++                    Options options;options.mode=variant==0?Mode::Cold:variant==1?Mode::Retained:Mode::RootProofs;options.sort_by_shape=variant==3;options.abstract_cash_bounds=variant==4;
++                    if(variant==5) options.max_root_proofs=0;
++                    auto r=solve(b,options);
++                    if(ref.empty())ref=r.ns_tricks;
++                    if(r.ns_tricks!=ref) {std::cerr<<"MISMATCH family="<<fi<<" constraint="<<constraint<<" size="<<size<<" variant="<<variant<<'\n';return 2;}
++                    auto s=r.stats;
++                    std::cout<<fi<<','<<constraint<<','<<cards<<','<<size<<','<<rep<<','<<variant<<','<<s.total_ms<<','<<s.validation_ms<<','<<s.trick_nodes<<','<<s.tt_lookups<<','<<s.tt_hits<<','<<s.root_complete_hits<<','<<s.root_partial_hits<<','<<s.root_proofs<<','<<s.root_checks<<','<<s.shape_bound_hits<<','<<s.tt_mib<<'\n';std::cout.flush();
++                }
++            }
++            if(size==count)for(int i=0;i<count;++i)scores<<fi<<','<<constraint<<','<<i<<','<<ref[i]<<'\n';
++        }
++        scores.flush();
++    }
++}
+diff --git a/benchmarks/related_batch_test.cpp b/benchmarks/related_batch_test.cpp
+new file mode 100644
+index 0000000..692f62a
+--- /dev/null
++++ b/benchmarks/related_batch_test.cpp
+@@ -0,0 +1,264 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <gtest/gtest.h>
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <numeric>
++#include <random>
++#include <related_batch.hpp>
++#include <api/solve_board.hpp>
++using namespace related_batch;
++namespace {
++auto family(int cards,int count,unsigned seed,int trump=4,int first=3) -> Batch
++{
++    std::mt19937 rng(seed); std::array<int,52> deck{};
++    std::iota(deck.begin(),deck.end(),0); std::shuffle(deck.begin(),deck.end(),rng);
++    Batch b{}; b.trump=trump; b.first=first; std::vector<int> ew;
++    for(int i=0;i<cards;++i) {
++        int n=deck[i],s=deck[13+i]; b.north[n/13]|=1u<<(n%13+2); b.south[s/13]|=1u<<(s%13+2);
++        ew.push_back(deck[26+i]); ew.push_back(deck[39+i]);
++    }
++    for(int j=0;j<count;++j) {
++        std::shuffle(ew.begin(),ew.end(),rng); Defenders d{};
++        for(int i=0;i<2*cards;++i) (i<cards?d.east:d.west)[ew[i]/13]|=1u<<(ew[i]%13+2);
++        b.layouts.push_back(d);
++    }
++    return b;
++}
++auto reference(const Batch& b) -> std::vector<int>
++{
++    SolverContext ctx; std::vector<int> out;
++    for(std::size_t i=0;i<b.layouts.size();++i) {
++        const auto dl=make_deal(b,i); ctx.reset_for_solve(); FutureTricks f{};
++        EXPECT_EQ(solve_board(ctx,dl,-1,1,1,&f),RETURN_NO_FAULT);
++        int cards=0,partial=0;
++        for(auto& h:dl.remainCards) for(auto c:h) cards+=std::popcount(c);
++        for(auto r:b.current_trick_rank) partial+=(r!=0);
++        int tricks=(cards+partial)/4;
++        out.push_back(((b.first+partial)%2)?tricks-f.score[0]:f.score[0]);
++    }
++    return out;
++}
++}
++TEST(RelatedBatch, RejectsWholeBatchBeforeSolving)
++{
++    auto b=family(5,3,412); EXPECT_NO_THROW(validate(b));
++    auto bad=b; bad.layouts.clear(); EXPECT_THROW(validate(bad),std::invalid_argument);
++    bad=b; bad.trump=5; EXPECT_THROW(solve(bad),std::invalid_argument);
++    bad=b; bad.first=-1; EXPECT_THROW(validate(bad),std::invalid_argument);
++    bad=b; bad.north[0]|=1; EXPECT_THROW(validate(bad),std::invalid_argument);
++    bad=b; bad.south=b.north; EXPECT_THROW(validate(bad),std::invalid_argument);
++    bad=b; bad.layouts.back().east=bad.north; EXPECT_THROW(solve(bad),std::invalid_argument);
++    bad=b; bad.layouts[1].east={}; EXPECT_THROW(validate(bad),std::invalid_argument);
++}
++TEST(RelatedBatch, RejectsDifferentRemainingDeck)
++{
++    auto b=family(2,2,31); bool changed=false;
++    for(int s=0;s<4&&!changed;++s) for(int r=2;r<=14&&!changed;++r) {
++        auto bit=1u<<r; auto& d=b.layouts[1];
++        if(!(bit&(b.north[s]|b.south[s]|d.east[s]|d.west[s])))
++            for(int t=0;t<4&&!changed;++t) if(d.east[t]) {
++                d.east[t]&=d.east[t]-1; d.east[s]|=bit; changed=true;
++            }
++    }
++    ASSERT_TRUE(changed); EXPECT_THROW(validate(b),std::invalid_argument);
++}
++TEST(RelatedBatch, ModesAgreeWithIndependentNativeSolves)
++{
++    for(int trump=0;trump<5;++trump) for(int first=0;first<4;++first) {
++        auto b=family(5,25,815+trump*4+first,trump,first); auto expected=reference(b);
++        for(auto mode:{Mode::Cold,Mode::Retained,Mode::RootProofs}) {
++            Options o; o.mode=mode; EXPECT_EQ(solve(b,o).ns_tricks,expected);
++            o.sort_by_shape=true; EXPECT_EQ(solve(b,o).ns_tricks,expected);
++        }
++    }
++}
++TEST(RelatedBatch, DuplicateLayoutsUseRootProofs)
++{
++    auto b=family(8,1,9143); b.layouts.resize(20,b.layouts[0]);
++    Options o; o.mode=Mode::RootProofs; auto result=solve(b,o);
++    EXPECT_EQ(result.ns_tricks,reference(b)); EXPECT_EQ(result.stats.root_complete_hits,19u);
++}
++TEST(RelatedBatch, PartialTricksAreValidatedAndSolved)
++{
++    for(int partial=1;partial<=3;++partial) {
++        auto b=family(5,1,223+partial,partial%5,3);
++        for(int i=0;i<partial;++i) {
++            int hand=(b.first+i)%4;
++            auto* h=hand==0?&b.north:hand==2?&b.south:hand==1?&b.layouts[0].east:&b.layouts[0].west;
++            int suit=0;
++            if(i&&(*h)[b.current_trick_suit[0]]) suit=b.current_trick_suit[0];
++            else while(!(*h)[suit]) ++suit;
++            int rank=std::countr_zero((*h)[suit]); (*h)[suit]^=1u<<rank;
++            b.current_trick_suit[i]=suit; b.current_trick_rank[i]=rank;
++        }
++        b.layouts.resize(4,b.layouts[0]); EXPECT_NO_THROW(validate(b));
++        Options o; o.mode=Mode::RootProofs; EXPECT_EQ(solve(b,o).ns_tricks,reference(b));
++        auto bad=b; bad.current_trick_rank[0]=0; EXPECT_THROW(validate(bad),std::invalid_argument);
++        bad=b; bad.current_trick_rank[0]=15; EXPECT_THROW(validate(bad),std::invalid_argument);
++    }
++}
++TEST(RelatedBatch, LastTrickAndFullDeal)
++{
++    for(int trump=0;trump<5;++trump) {
++        auto b=family(1,30,567+trump,trump); EXPECT_EQ(solve(b).ns_tricks,reference(b));
++    }
++    auto b=family(13,8,2911); Options o; o.mode=Mode::RootProofs;
++    EXPECT_EQ(solve(b,o).ns_tricks,reference(b));
++}
++TEST(RelatedBatch, AbstractCashCertificateCoversDifferentDefenderShapes)
++{
++    Batch b; b.first=0; b.trump=4; b.north[0]=(1u<<14)|(1u<<13)|(1u<<12);
++    b.south[3]=(1u<<2)|(1u<<3)|(1u<<4);
++    std::array<unsigned,6> cards={2,3,4,15,16,17};
++    for(unsigned bits=0;bits<64;++bits) if(std::popcount(bits)==3) {
++        Defenders d;
++        for(int i=0;i<6;++i) (bits&(1u<<i)?d.east:d.west)[cards[i]/13+1]|=1u<<(cards[i]%13);
++        b.layouts.push_back(d);
++    }
++    Options o; o.abstract_cash_bounds=true;
++    auto r=solve(b,o); EXPECT_EQ(r.ns_tricks,reference(b));
++    EXPECT_EQ(r.stats.native_solves,0u); EXPECT_EQ(r.stats.shape_bound_hits,20u);
++    // A heart ruff invalidates cashing side-suit winners across these shapes.
++    b.trump=1; EXPECT_EQ(solve(b,o).ns_tricks,reference(b));
++}
++TEST(RelatedBatch, AbstractBoundsAndTinyCacheAgreeWithNative)
++{
++    for(int seed=0;seed<10;++seed) {
++        auto b=family(6,100,929+seed,seed%5,seed%4); auto ref=reference(b);
++        Options o; o.mode=Mode::RootProofs; o.abstract_cash_bounds=true; o.max_root_proofs=3;o.max_proofs_per_shape=1;o.memory_mb=1;
++        EXPECT_EQ(solve(b,o).ns_tricks,ref);
++    }
++}
++namespace {
++auto brute(Deal& dl,std::array<int,4>& table,int leader,int played,int remaining) -> int
++{
++    if(!remaining) return 0;
++    int hand=(leader+played)%4, best=(hand%2)?99:-1;
++    int led=played?table[0]/15:-1;
++    for(int suit=0;suit<4;++suit) {
++        if(played&&dl.remainCards[hand][led]&&suit!=led) continue;
++        unsigned mask=dl.remainCards[hand][suit];
++        while(mask) {
++            int rank=std::countr_zero(mask); mask&=mask-1;
++            auto old=table; table[played]=15*suit+rank;
++            dl.remainCards[hand][suit]^=1u<<rank; int value;
++            if(played==3) {
++                int winner=0;
++                for(int j=1;j<4;++j) {
++                    int a=table[j]/15,b=table[winner]/15;
++                    if((a==b&&table[j]%15>table[winner]%15)||(a==dl.trump&&b!=dl.trump)) winner=j;
++                }
++                int seat=(leader+winner)%4;
++                value=(seat%2==0)+brute(dl,table,seat,0,remaining-1);
++            } else value=brute(dl,table,leader,played+1,remaining-1);
++            dl.remainCards[hand][suit]|=1u<<rank;table=old;
++            best=hand%2?std::min(best,value):std::max(best,value);
++        }
++    }
++    return best;
++}
++}
++TEST(RelatedBatch, ExhaustiveThreeCardDefensesMatchIndependentMinimax)
++{
++    for(int seed=0;seed<3;++seed) for(int trump=0;trump<5;++trump) for(int first=0;first<4;++first) {
++        auto b=family(3,1,93041+seed,trump,first); std::vector<std::pair<int,int>> cards;
++        for(int s=0;s<4;++s) for(int r=2;r<=14;++r)
++            if((b.layouts[0].east[s]|b.layouts[0].west[s])&(1u<<r))cards.emplace_back(s,r);
++        b.layouts.clear();
++        for(unsigned bits=0;bits<64;++bits) if(std::popcount(bits)==3) {
++            Defenders d;
++            for(int i=0;i<6;++i)(bits&(1u<<i)?d.east:d.west)[cards[i].first]|=1u<<cards[i].second;
++            b.layouts.push_back(d);
++        }
++        std::vector<int> expected;
++        for(std::size_t i=0;i<b.layouts.size();++i) {
++            auto dl=make_deal(b,i); std::array<int,4> table{};
++            expected.push_back(brute(dl,table,first,0,12));
++        }
++        Options o; o.mode=Mode::RootProofs; o.abstract_cash_bounds=true;
++        EXPECT_EQ(solve(b,o).ns_tricks,expected);
++    }
++}
++TEST(RelatedBatch, VariedLayoutsAfterOneTwoOrThreeKnownCards)
++{
++    for(int seed=0;seed<5;++seed) for(int partial=1;partial<=3;++partial) {
++        auto source=family(7,400,76000+seed,seed,seed%4); Batch b=source; b.layouts.clear();
++        auto chosen=make_deal(source,0);
++        for(int k=0;k<partial;++k) {
++            int hand=(source.first+k)%4,suit=0;
++            if(k&&chosen.remainCards[hand][b.current_trick_suit[0]]) suit=b.current_trick_suit[0];
++            else while(!chosen.remainCards[hand][suit])++suit;
++            int rank=std::countr_zero(chosen.remainCards[hand][suit]);
++            b.current_trick_suit[k]=suit;b.current_trick_rank[k]=rank;
++            if(hand==0)b.north[suit]^=1u<<rank;
++            if(hand==2)b.south[suit]^=1u<<rank;
++        }
++        for(std::size_t i=0;i<source.layouts.size();++i) {
++            auto dl=make_deal(source,i);bool valid=true;
++            for(int k=0;k<partial;++k) {
++                int h=(b.first+k)%4,s=b.current_trick_suit[k],r=b.current_trick_rank[k];
++                if(!(dl.remainCards[h][s]&(1u<<r))) {valid=false;break;}
++                if(k&&s!=b.current_trick_suit[0]&&dl.remainCards[h][b.current_trick_suit[0]]) {valid=false;break;}
++                dl.remainCards[h][s]^=1u<<r;
++            }
++            if(valid) {
++                Defenders d;for(int s=0;s<4;++s){d.east[s]=dl.remainCards[1][s];d.west[s]=dl.remainCards[3][s];}
++                b.layouts.push_back(d);
++            }
++        }
++        ASSERT_FALSE(b.layouts.empty());Options o;o.abstract_cash_bounds=true;
++        EXPECT_EQ(solve(b,o).ns_tricks,reference(b));
++    }
++}
++TEST(RelatedBatch, RejectsRevokeAndCurrentTrickDuplication)
++{
++    Batch b; b.first=3; b.trump=4;
++    b.north[0]=1u<<14;b.north[1]=1u<<14;b.south[2]=(1u<<14)|(1u<<13);
++    Defenders d;d.east[3]=(1u<<14)|(1u<<13);d.west[0]=1u<<13;b.layouts={d};
++    b.current_trick_suit[0]=0;b.current_trick_rank[0]=12;
++    EXPECT_NO_THROW(validate(b));
++    auto bad=b;bad.layouts[0].west[0]|=1u<<12;EXPECT_THROW(validate(bad),std::invalid_argument);
++    // North discards HA but still holds SA.
++    bad=b;bad.north[1]=0;bad.current_trick_suit[1]=1;bad.current_trick_rank[1]=14;
++    EXPECT_THROW(validate(bad),std::invalid_argument);
++}
++TEST(RelatedBatch, ExhaustiveFourCardAllocationsExerciseGeneralizedRootHits)
++{
++    std::size_t hits=0;
++    for(int seed=0;seed<20;++seed) for(int trump=0;trump<5;++trump) {
++        auto b=family(4,1,37120+seed,trump,seed%4);
++        std::vector<std::pair<int,int>> cards;
++        for(int s=0;s<4;++s) for(int r=2;r<=14;++r)
++            if((b.layouts[0].east[s]|b.layouts[0].west[s])&(1u<<r))cards.emplace_back(s,r);
++        b.layouts.clear();
++        for(unsigned bits=0;bits<256;++bits) if(std::popcount(bits)==4) {
++            Defenders d;
++            for(int i=0;i<8;++i)(bits&(1u<<i)?d.east:d.west)[cards[i].first]|=1u<<cards[i].second;
++            b.layouts.push_back(d);
++        }
++        auto expected=reference(b);
++        Options o;o.mode=Mode::RootProofs;o.sort_by_shape=true;
++        auto r=solve(b,o); EXPECT_EQ(r.ns_tricks,expected);
++        hits+=r.stats.root_complete_hits;
++    }
++    EXPECT_GT(hits,0u);
++}
++
++TEST(RelatedBatch, AutomaticModeUsesLightweightSmallBatchesAndGroupsLargeBatches)
++{
++    EXPECT_EQ(Options{}.mode,Mode::Automatic);
++    for(int cards:{4,8}) for(int count:{1,4,64,256,300}) {
++        auto b=family(cards,count,172199,2,1);
++        auto automatic=solve(b);
++        Options explicit_options;
++        const bool use_root=count>256||(cards<=7&&count>=64);
++        explicit_options.mode=use_root?Mode::RootProofs:Mode::Retained;
++        explicit_options.sort_by_shape=count>256;
++        auto explicit_result=solve(b,explicit_options);
++        EXPECT_EQ(automatic.ns_tricks,explicit_result.ns_tricks);
++        EXPECT_EQ(automatic.stats.trick_nodes,explicit_result.stats.trick_nodes);
++        EXPECT_EQ(automatic.stats.root_proofs,explicit_result.stats.root_proofs);
++        EXPECT_EQ(automatic.stats.root_complete_hits,explicit_result.stats.root_complete_hits);
++    }
++}
+diff --git a/library/src/related_batch.cpp b/library/src/related_batch.cpp
+new file mode 100644
+index 0000000..37bb605
+--- /dev/null
++++ b/library/src/related_batch.cpp
+@@ -0,0 +1,397 @@
++// SPDX-License-Identifier: Apache-2.0
++// Rank certificates are DDS's existing winning-rank proof; credit the upstream authors.
++#include "related_batch.hpp"
++
++#include <algorithm>
++#include <bit>
++#include <chrono>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++
++#include <ab_search.hpp>
++#include <api/solve_board.hpp>
++
++namespace related_batch
++{
++namespace
++{
++using Clock = std::chrono::steady_clock;
++
++auto elapsed(Clock::time_point start) -> double
++{
++    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
++}
++
++auto invalid(std::size_t index, const char* reason) -> void
++{
++    throw std::invalid_argument("layout " + std::to_string(index) + ": " + reason);
++}
++
++auto partial_count(const Batch& batch) -> int
++{
++    return static_cast<int>(std::count_if(
++        batch.current_trick_rank.begin(), batch.current_trick_rank.end(),
++        [](int rank) { return rank != 0; }));
++}
++
++auto shape_key(const Hand& east) -> unsigned
++{
++    unsigned key = 0;
++    for (int suit = 0; suit < 4; ++suit) {
++        key |= static_cast<unsigned>(std::popcount(east[suit])) << (4 * suit);
++    }
++    return key;
++}
++
++auto packed(const Hand& hand) -> std::uint64_t
++{
++    std::uint64_t value = 0;
++    for (int suit = 0; suit < 4; ++suit) {
++        value |= static_cast<std::uint64_t>(hand[suit] >> 2) << (13 * suit);
++    }
++    return value;
++}
++
++// A small, formally sufficient shape abstraction, independent of search.
++// If the leader holds the top k remaining cards of a suit, that hand can
++// cash them when no other hand can ruff before trick k. Exact lengths are
++// unnecessary: len(suit) >= k OR len(trump) == 0 suffices for each other
++// hand. In NT or the trump suit there are no shape conditions at all.
++struct CashCertificate
++{
++    int suit, count;
++    unsigned mask;
++};
++
++auto cash_certificates(const Deal& first, int tricks) -> std::vector<CashCertificate>
++{
++    std::vector<CashCertificate> proofs;
++    for (int suit = 0; suit < 4; ++suit) {
++        unsigned live = 0, mask = 0;
++        int count = 0;
++        for (int hand = 0; hand < 4; ++hand) {
++            live |= first.remainCards[hand][suit];
++        }
++        for (int rank = 14; rank >= 2 && count < tricks; --rank) {
++            if (live & (1u << rank)) {
++                mask |= 1u << rank;
++                ++count;
++                proofs.push_back({suit, count, mask});
++            }
++        }
++    }
++    std::stable_sort(proofs.begin(), proofs.end(), [](const auto& a, const auto& b) {
++        return a.count > b.count;
++    });
++    return proofs;
++}
++
++auto cash_bound(const Deal& deal, const std::vector<CashCertificate>& proofs) -> int
++{
++    for (const auto& proof : proofs) {
++        if ((deal.remainCards[deal.first][proof.suit] & proof.mask) != proof.mask) {
++            continue;
++        }
++        bool safe = true;
++        if (deal.trump != 4 && proof.suit != deal.trump) {
++            for (int hand = 0; hand < 4; ++hand) {
++                if (hand != deal.first && deal.remainCards[hand][deal.trump] &&
++                    std::popcount(deal.remainCards[hand][proof.suit]) < proof.count) {
++                    safe = false;
++                }
++            }
++        }
++        if (safe) {
++            return proof.count;
++        }
++    }
++    return 0;
++}
++
++struct Proof
++{
++    std::uint64_t mask = 0, east = 0;
++    int lower = 0, upper = 13;
++};
++
++using Proofs = std::unordered_map<unsigned, std::vector<Proof>>;
++
++auto check(const std::vector<Proof>& proofs, std::uint64_t east,
++           int& lower, int& upper, Stats& stats) -> void
++{
++    for (const auto& proof : proofs) {
++        ++stats.root_checks;
++        if ((east & proof.mask) != proof.east) {
++            continue;
++        }
++        lower = std::max(lower, proof.lower);
++        upper = std::min(upper, proof.upper);
++        if (lower >= upper) {
++            break;
++        }
++    }
++    if (lower > upper) {
++        throw std::logic_error("contradictory root certificates");
++    }
++}
++
++auto record(std::vector<Proof>& proofs, const Deal& deal, const unsigned short ranks[],
++            int target, bool value, int tricks, const Options& options, Stats& stats) -> void
++{
++    Proof proof;
++    proof.upper = tricks;
++    if (value) {
++        proof.lower = target;
++    } else {
++        proof.upper = target - 1;
++    }
++    for (int suit = 0; suit < 4; ++suit) {
++        // Like DDS TT: every live rank at or above the lowest winning rank
++        // matters, not only the winning ranks themselves. N/S and the full
++        // remaining deck are fixed by batch validation. E/W lengths are
++        // exact in the map key; W ownership is the complement of E.
++        unsigned relevant = ranks[suit] ?
++            (0x1fffu << std::countr_zero(ranks[suit])) & 0x1fffu : 0;
++        relevant &= (deal.remainCards[1][suit] | deal.remainCards[3][suit]) >> 2;
++        proof.mask |= static_cast<std::uint64_t>(relevant) << (13 * suit);
++        proof.east |= static_cast<std::uint64_t>(
++            relevant & (deal.remainCards[1][suit] >> 2)) << (13 * suit);
++    }
++    for (auto& old : proofs) {
++        if (old.mask == proof.mask && old.east == proof.east) {
++            old.lower = std::max(old.lower, proof.lower);
++            old.upper = std::min(old.upper, proof.upper);
++            return;
++        }
++    }
++    if (proofs.size() >= options.max_proofs_per_shape ||
++        stats.root_proofs >= options.max_root_proofs) {
++        return;
++    }
++    proofs.push_back(proof);
++    ++stats.root_proofs;
++}
++
++auto refine(SolverContext& context, const Deal& deal, int partial, int tricks,
++            int lower, int upper, std::vector<Proof>& proofs,
++            const Options& options, Stats& stats) -> int
++{
++    using Search = bool (*)(Pos*, int, int, SolverContext&);
++    const Search search[4] = {ab_search, ab_search_1, ab_search_2, ab_search_3};
++    auto* thread = context.thread_ptr();
++    const int depth = context.search().ini_depth();
++    const int next = (deal.first + partial) % 4;
++    int guess = std::clamp(7 - (next & 1), lower + 1, upper);
++    while (lower < upper) {
++        context.reset_best_moves_lite();
++        const bool value = search[partial](&thread->lookAheadPos, guess, depth, context);
++        record(proofs, deal, thread->lookAheadPos.win_ranks[depth], guess, value,
++               tricks, options, stats);
++        if (value) {
++            lower = guess;
++        } else {
++            upper = guess - 1;
++        }
++        guess = value ? std::min(guess + 1, upper) : upper;
++    }
++    return lower;
++}
++
++auto solve_layout(SolverContext& context, const Deal& deal, int partial, int tricks,
++                  int lower, int upper, std::vector<Proof>* proofs,
++                  const Options& options, Stats& stats) -> int
++{
++    if (lower == upper) {
++        ++stats.root_complete_hits;
++        return lower;
++    }
++    if (lower || upper < tricks) {
++        ++stats.root_partial_hits;
++    }
++    if (options.mode == Mode::Cold) {
++        context.reset_for_solve();
++    }
++    FutureTricks result{};
++    ++stats.native_solves;
++    // target=0 performs ordinary DDS initialization, without a scored search.
++    // The scalar batch driver then preserves each completed root proof.
++    const int target = proofs && tricks > 1 ? 0 : -1;
++    const int mode = options.mode == Mode::Cold ? 1 : 2;
++    const int code = solve_board(context, deal, target, 1, mode, &result);
++    if (code != RETURN_NO_FAULT) {
++        throw std::runtime_error("DDS returned " + std::to_string(code));
++    }
++    const int score = !proofs || tricks == 1 ? result.score[0] :
++        refine(context, deal, partial, tricks, lower, upper, *proofs, options, stats);
++    stats.trick_nodes += context.search().trick_nodes();
++    stats.tt_lookups += context.thread_ptr()->tt_lookup_count;
++    stats.tt_hits += context.thread_ptr()->tt_hit_count;
++    stats.tt_mib = std::max(stats.tt_mib, context.trans_table()->memory_in_use() / 1024.0);
++    return score;
++}
++
++auto validated_current_trick(const Batch& batch, int& partial) -> Hand
++{
++    Hand on_table{};
++    bool gap = false;
++    for (int index = 0; index < 3; ++index) {
++        const int rank = batch.current_trick_rank[index];
++        const int suit = batch.current_trick_suit[index];
++        if (!rank) {
++            gap = true;
++            continue;
++        }
++        if (gap || rank < 2 || rank > 14 || suit < 0 || suit > 3) {
++            throw std::invalid_argument("invalid or noncontiguous current trick");
++        }
++        if (on_table[suit] & (1u << rank)) {
++            throw std::invalid_argument("duplicate current-trick card");
++        }
++        on_table[suit] |= 1u << rank;
++        ++partial;
++    }
++    return on_table;
++}
++} // namespace
++
++auto make_deal(const Batch& batch, std::size_t index) -> Deal
++{
++    if (index >= batch.layouts.size()) {
++        throw std::out_of_range("layout index");
++    }
++    Deal deal{};
++    deal.first = batch.first;
++    deal.trump = batch.trump;
++    for (int suit = 0; suit < 4; ++suit) {
++        deal.remainCards[0][suit] = batch.north[suit];
++        deal.remainCards[2][suit] = batch.south[suit];
++        deal.remainCards[1][suit] = batch.layouts[index].east[suit];
++        deal.remainCards[3][suit] = batch.layouts[index].west[suit];
++    }
++    for (int index = 0; index < 3; ++index) {
++        deal.currentTrickRank[index] = batch.current_trick_rank[index];
++        deal.currentTrickSuit[index] = batch.current_trick_suit[index];
++    }
++    return deal;
++}
++
++auto validate(const Batch& batch) -> void
++{
++    if (batch.layouts.empty()) {
++        throw std::invalid_argument("batch is empty");
++    }
++    if (batch.trump < 0 || batch.trump > 4 || batch.first < 0 || batch.first > 3) {
++        throw std::invalid_argument("invalid strain or leader");
++    }
++    int partial = 0;
++    const Hand on_table = validated_current_trick(batch, partial);
++    Hand universe{};
++    for (std::size_t index = 0; index < batch.layouts.size(); ++index) {
++        const auto deal = make_deal(batch, index);
++        Hand seen = on_table;
++        std::array<int, 4> count{};
++        for (int hand = 0; hand < 4; ++hand) {
++            for (int suit = 0; suit < 4; ++suit) {
++                const unsigned cards = deal.remainCards[hand][suit];
++                if (cards & ~0x7ffcu) {
++                    invalid(index, "rank mask contains bits outside 2..14");
++                }
++                if (cards & seen[suit]) {
++                    invalid(index, "card occurs in more than one hand or on table");
++                }
++                seen[suit] |= cards;
++                count[hand] += std::popcount(cards);
++            }
++        }
++        for (int played = 0; played < partial; ++played) {
++            const int hand = (batch.first + played) % 4;
++            ++count[hand];
++            if (played && batch.current_trick_suit[played] != batch.current_trick_suit[0] &&
++                deal.remainCards[hand][batch.current_trick_suit[0]]) {
++                invalid(index, "current trick revokes while holding led suit");
++            }
++        }
++        if (count[0] < 1 || count[0] > 13 ||
++            !std::all_of(count.begin(), count.end(), [&](int n) { return n == count[0]; })) {
++            invalid(index, "hands have inconsistent card counts");
++        }
++        if (index == 0) {
++            universe = seen;
++        } else if (seen != universe) {
++            invalid(index, "remaining deck differs from first layout");
++        }
++    }
++}
++
++auto solve(const Batch& batch, const Options& requested_options) -> Result
++{
++    const auto start = Clock::now();
++    validate(batch);
++    Result output;
++    output.stats.validation_ms = elapsed(start);
++    Options options = requested_options;
++    if (options.memory_mb < 1) {
++        throw std::invalid_argument("memory_mb must be positive");
++    }
++    const int partial = partial_count(batch);
++    const int next = (batch.first + partial) % 4;
++    const auto first = make_deal(batch, 0);
++    int total = partial;
++    for (const auto& hand : first.remainCards) {
++        for (auto cards : hand) {
++            total += std::popcount(cards);
++        }
++    }
++    const int tricks = total / 4;
++    if (options.mode == Mode::Automatic) {
++        const bool large_batch = batch.layouts.size() > 256;
++        const bool short_batch = tricks <= 7 && batch.layouts.size() >= 64;
++        options.mode = large_batch || short_batch || options.abstract_cash_bounds ?
++            Mode::RootProofs : Mode::Retained;
++        options.sort_by_shape = large_batch;
++    }
++    std::vector<std::size_t> order(batch.layouts.size());
++    std::iota(order.begin(), order.end(), 0);
++    if (options.sort_by_shape) {
++        std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
++            return shape_key(batch.layouts[a].east) < shape_key(batch.layouts[b].east);
++        });
++    }
++    SolverConfig config;
++    config.tt_mem_default_mb_ = std::min(16, options.memory_mb);
++    config.tt_mem_maximum_mb_ = options.memory_mb;
++    {
++        SolverContext context(config);
++        Proofs cache;
++        output.ns_tricks.resize(order.size());
++        const auto cash = options.abstract_cash_bounds && partial == 0 ?
++            cash_certificates(first, tricks) : std::vector<CashCertificate>{};
++        for (auto index : order) {
++            const auto deal = make_deal(batch, index);
++            int lower = 0, upper = tricks;
++            auto* proofs = options.mode == Mode::RootProofs ?
++                &cache[shape_key(batch.layouts[index].east)] : nullptr;
++            if (proofs) {
++                check(*proofs, packed(batch.layouts[index].east), lower, upper, output.stats);
++            }
++            if (!cash.empty()) {
++                const int bound = cash_bound(deal, cash);
++                if (bound > lower) {
++                    lower = bound;
++                    ++output.stats.shape_bound_hits;
++                }
++                if (lower > upper) {
++                    throw std::logic_error("contradictory cash certificate");
++                }
++            }
++            const int score = solve_layout(context, deal, partial, tricks, lower, upper,
++                                           proofs, options, output.stats);
++            output.ns_tricks[index] = (next & 1) ? tricks - score : score;
++        }
++    }
++    output.stats.total_ms = elapsed(start);
++    return output;
++}
++} // namespace related_batch
+diff --git a/library/src/related_batch.hpp b/library/src/related_batch.hpp
+new file mode 100644
+index 0000000..1096fef
+--- /dev/null
++++ b/library/src/related_batch.hpp
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: Apache-2.0
++// Faster-DDS additions by Max Schireson's project with OpenAI ChatGPT/Codex assistance.
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++#include <api/dds_data_types.hpp>
++
++namespace related_batch
++{
++using Hand = std::array<unsigned, 4>;
++
++struct Defenders
++{
++    Hand east{}, west{};
++};
++
++/**
++ * Fixed N/S, fixed strain and current trick, and allocations of one fixed E/W pool.
++ * Masks use DDS public bits 2..14, in S,H,D,C order. Current-trick cards are
++ * excluded from all hands. Repeated layouts are permitted.
++ */
++struct Batch
++{
++    Hand north{}, south{};
++    std::vector<Defenders> layouts;
++    int trump = 4;
++    int first = 3;
++    std::array<int, 3> current_trick_suit{}, current_trick_rank{};
++};
++
++enum class Mode { Cold, Retained, RootProofs, Automatic };
++
++struct Options
++{
++    // Automatic adds root certificates above 256 layouts, or from 64 layouts
++    // when at most seven tricks remain. Shape ordering starts above 256.
++    // Explicit cash bounds opt in to the root driver even for small batches.
++    Mode mode = Mode::Automatic;
++    // Automatic chooses ordering; select an explicit mode to override it.
++    bool sort_by_shape = false;
++    bool abstract_cash_bounds = false;
++    int memory_mb = 256;
++    std::size_t max_root_proofs = 65536;
++    std::size_t max_proofs_per_shape = 128;
++};
++
++struct Stats
++{
++    // DDS counts completed-trick transitions, not every card-play node.
++    std::uint64_t trick_nodes = 0, tt_lookups = 0, tt_hits = 0;
++    // These presearch hit counts include the optional cashing certificates.
++    std::size_t native_solves = 0, root_complete_hits = 0, root_partial_hits = 0;
++    std::size_t root_proofs = 0, root_checks = 0, shape_bound_hits = 0;
++    // total_ms includes validation, ordering, context creation and destruction.
++    // tt_mib reports sampled peak TT usage, excluding the small root cache.
++    double validation_ms = 0, total_ms = 0, tt_mib = 0;
++};
++
++struct Result
++{
++    std::vector<int> ns_tricks;
++    Stats stats;
++};
++
++/** Validate every layout before allocating a solver or doing any search.
++ * Throws std::invalid_argument with the layout index and cause.
++ * Supports 1..13 cards per hand at the start of the current trick.
++ */
++auto validate(const Batch& batch) -> void;
++
++/** Assemble an individual DDS deal; this does not perform batch validation. */
++auto make_deal(const Batch& batch, std::size_t index) -> Deal;
++
++/** Exact double-dummy N/S remaining tricks, including an incomplete trick.
++ * Returns one score per input layout in original order. Each call owns its
++ * context and caches, preventing incompatible strains/families from sharing
++ * bounds. Separate calls may run concurrently using separate input objects.
++ * Scalar scores only: no best move or common information-limited policy.
++ */
++auto solve(const Batch& batch, const Options& options = {}) -> Result;
++} // namespace related_batch
