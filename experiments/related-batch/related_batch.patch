@@ -23,10 +23,10 @@ index 018a76f..db3ed69 100644
 +)
 diff --git a/benchmarks/related_batch_benchmark.cpp b/benchmarks/related_batch_benchmark.cpp
 new file mode 100644
-index 0000000..53f9e7e
+index 0000000..a7090f7
 --- /dev/null
 +++ b/benchmarks/related_batch_benchmark.cpp
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,96 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include <related_batch.hpp>
 +#include <algorithm>
@@ -59,7 +59,14 @@ index 0000000..53f9e7e
 +    std::array<int,4> base_shape{}; int base_hcp=0;
 +    for(int i=0;i<cards;++i) {int c=deck[26+i];++base_shape[c/13];base_hcp+=std::max(0,c%13-8);}
 +    std::set<std::array<unsigned,4>> seen;
++    std::uint64_t capacity = 1;
++    for(int i=1;i<=need_e;++i) capacity=capacity*(ew.size()-i+1)/i;
++    if(static_cast<std::uint64_t>(count)>capacity)
++        throw std::invalid_argument("requested more distinct layouts than the E/W pool permits");
++    unsigned attempts=0;
 +    while(static_cast<int>(b.layouts.size())<count) {
++        if(++attempts>1000000)
++            throw std::runtime_error("constraint rejection limit reached; request fewer layouts");
 +        std::shuffle(ew.begin(),ew.end(),rng); Defenders d=fixed;
 +        for(std::size_t i=0;i<ew.size();++i) (static_cast<int>(i)<need_e?d.east:d.west)[ew[i]/13]|=1u<<(ew[i]%13+2);
 +        if(constraint==1) {
@@ -70,7 +77,7 @@ index 0000000..53f9e7e
 +            }
 +            if(!fits||std::abs(hcp-base_hcp)>2) continue;
 +        }
-+        if(cards>=10&&!seen.insert(d.east).second) continue;
++        if(!seen.insert(d.east).second) continue;
 +        b.layouts.push_back(d);
 +    }
 +    validate(b); return b;
@@ -82,11 +89,16 @@ index 0000000..53f9e7e
 +    const int repeats=argc>3?std::stoi(argv[3]):3,cards=argc>4?std::stoi(argv[4]):13;
 +    const unsigned base=argc>5?std::stoul(argv[5]):20261118;
 +    const std::string prefix=argc>6?argv[6]:"batch";
++    const int selected_constraint=argc>7?std::stoi(argv[7]):-1;
++    const int variants=argc>8?std::stoi(argv[8]):5;
++    if(cards<1||cards>13||count<1||families<1||repeats<1||selected_constraint<-1||selected_constraint>2||variants<5||variants>6)
++        throw std::invalid_argument("invalid benchmark parameters");
 +    std::ofstream hands(prefix+"_hands.csv"), scores(prefix+"_scores.csv");
 +    hands<<"family,constraint,index,trump,first"; for(int h=0;h<4;++h) for(int s=0;s<4;++s) hands<<",h"<<h<<"s"<<s; hands<<'\n';
 +    scores<<"family,constraint,index,ns_tricks\n";
 +    std::cout<<"family,constraint,cards,size,repeat,variant,total_ms,validation_ms,nodes,tt_lookups,tt_hits,root_full,root_partial,root_proofs,root_checks,shape_bound_hits,tt_mib\n";
 +    for(int fi=0;fi<families;++fi) for(int constraint=0;constraint<3;++constraint) {
++        if(selected_constraint>=0&&constraint!=selected_constraint) continue;
 +        auto all=make_family(cards,count,base+fi,fi%5,constraint);
 +        for(int i=0;i<count;++i) {auto dl=make_deal(all,i);hands<<fi<<','<<constraint<<','<<i<<','<<all.trump<<','<<all.first;
 +            for(auto& h:dl.remainCards) { for(auto c:h) hands<<','<<c; }
@@ -95,9 +107,10 @@ index 0000000..53f9e7e
 +        std::vector<int> sizes={1,4,16,64,256,count}; std::sort(sizes.begin(),sizes.end()); sizes.erase(std::unique(sizes.begin(),sizes.end()),sizes.end());
 +        for(int size:sizes) {if(size>count) continue;auto b=all;b.layouts.resize(size);std::vector<int> ref;
 +            for(int rep=0;rep<repeats;++rep) {
-+                std::vector<int> modes={0,1,2,3,4};if(rep%2)std::reverse(modes.begin(),modes.end());
++                std::vector<int> modes(variants);std::iota(modes.begin(),modes.end(),0);if(rep%2)std::reverse(modes.begin(),modes.end());
 +                for(int variant:modes) {
 +                    Options options;options.mode=variant==0?Mode::Cold:variant==1?Mode::Retained:Mode::RootProofs;options.sort_by_shape=variant==3;options.abstract_cash_bounds=variant==4;
++                    if(variant==5) options.max_root_proofs=0;
 +                    auto r=solve(b,options);
 +                    if(ref.empty())ref=r.ns_tricks;
 +                    if(r.ns_tricks!=ref) {std::cerr<<"MISMATCH family="<<fi<<" constraint="<<constraint<<" size="<<size<<" variant="<<variant<<'\n';return 2;}
@@ -112,10 +125,10 @@ index 0000000..53f9e7e
 +}
 diff --git a/benchmarks/related_batch_test.cpp b/benchmarks/related_batch_test.cpp
 new file mode 100644
-index 0000000..d9b08e3
+index 0000000..692f62a
 --- /dev/null
 +++ b/benchmarks/related_batch_test.cpp
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,264 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include <gtest/gtest.h>
 +#include <algorithm>
@@ -244,7 +257,7 @@ index 0000000..d9b08e3
 +{
 +    for(int seed=0;seed<10;++seed) {
 +        auto b=family(6,100,929+seed,seed%5,seed%4); auto ref=reference(b);
-+        Options o; o.abstract_cash_bounds=true; o.max_root_proofs=3;o.max_proofs_per_shape=1;o.memory_mb=1;
++        Options o; o.mode=Mode::RootProofs; o.abstract_cash_bounds=true; o.max_root_proofs=3;o.max_proofs_per_shape=1;o.memory_mb=1;
 +        EXPECT_EQ(solve(b,o).ns_tricks,ref);
 +    }
 +}
@@ -294,7 +307,7 @@ index 0000000..d9b08e3
 +            auto dl=make_deal(b,i); std::array<int,4> table{};
 +            expected.push_back(brute(dl,table,first,0,12));
 +        }
-+        Options o; o.abstract_cash_bounds=true;
++        Options o; o.mode=Mode::RootProofs; o.abstract_cash_bounds=true;
 +        EXPECT_EQ(solve(b,o).ns_tricks,expected);
 +    }
 +}
@@ -356,18 +369,36 @@ index 0000000..d9b08e3
 +            b.layouts.push_back(d);
 +        }
 +        auto expected=reference(b);
-+        Options o;o.sort_by_shape=true;
++        Options o;o.mode=Mode::RootProofs;o.sort_by_shape=true;
 +        auto r=solve(b,o); EXPECT_EQ(r.ns_tricks,expected);
 +        hits+=r.stats.root_complete_hits;
 +    }
 +    EXPECT_GT(hits,0u);
 +}
++
++TEST(RelatedBatch, AutomaticModeUsesLightweightSmallBatchesAndGroupsLargeBatches)
++{
++    EXPECT_EQ(Options{}.mode,Mode::Automatic);
++    for(int cards:{4,8}) for(int count:{1,4,64,256,300}) {
++        auto b=family(cards,count,172199,2,1);
++        auto automatic=solve(b);
++        Options explicit_options;
++        const bool use_root=count>256||(cards<=7&&count>=64);
++        explicit_options.mode=use_root?Mode::RootProofs:Mode::Retained;
++        explicit_options.sort_by_shape=count>256;
++        auto explicit_result=solve(b,explicit_options);
++        EXPECT_EQ(automatic.ns_tricks,explicit_result.ns_tricks);
++        EXPECT_EQ(automatic.stats.trick_nodes,explicit_result.stats.trick_nodes);
++        EXPECT_EQ(automatic.stats.root_proofs,explicit_result.stats.root_proofs);
++        EXPECT_EQ(automatic.stats.root_complete_hits,explicit_result.stats.root_complete_hits);
++    }
++}
 diff --git a/library/src/related_batch.cpp b/library/src/related_batch.cpp
 new file mode 100644
-index 0000000..c29a5dc
+index 0000000..37bb605
 --- /dev/null
 +++ b/library/src/related_batch.cpp
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,397 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Rank certificates are DDS's existing winning-rank proof; credit the upstream authors.
 +#include "related_batch.hpp"
@@ -695,12 +726,13 @@ index 0000000..c29a5dc
 +    }
 +}
 +
-+auto solve(const Batch& batch, const Options& options) -> Result
++auto solve(const Batch& batch, const Options& requested_options) -> Result
 +{
 +    const auto start = Clock::now();
 +    validate(batch);
 +    Result output;
 +    output.stats.validation_ms = elapsed(start);
++    Options options = requested_options;
 +    if (options.memory_mb < 1) {
 +        throw std::invalid_argument("memory_mb must be positive");
 +    }
@@ -714,6 +746,13 @@ index 0000000..c29a5dc
 +        }
 +    }
 +    const int tricks = total / 4;
++    if (options.mode == Mode::Automatic) {
++        const bool large_batch = batch.layouts.size() > 256;
++        const bool short_batch = tricks <= 7 && batch.layouts.size() >= 64;
++        options.mode = large_batch || short_batch || options.abstract_cash_bounds ?
++            Mode::RootProofs : Mode::Retained;
++        options.sort_by_shape = large_batch;
++    }
 +    std::vector<std::size_t> order(batch.layouts.size());
 +    std::iota(order.begin(), order.end(), 0);
 +    if (options.sort_by_shape) {
@@ -759,10 +798,10 @@ index 0000000..c29a5dc
 +} // namespace related_batch
 diff --git a/library/src/related_batch.hpp b/library/src/related_batch.hpp
 new file mode 100644
-index 0000000..77799db
+index 0000000..1096fef
 --- /dev/null
 +++ b/library/src/related_batch.hpp
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,85 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Faster-DDS additions by Max Schireson's project with OpenAI ChatGPT/Codex assistance.
 +#pragma once
@@ -797,11 +836,15 @@ index 0000000..77799db
 +    std::array<int, 3> current_trick_suit{}, current_trick_rank{};
 +};
 +
-+enum class Mode { Cold, Retained, RootProofs };
++enum class Mode { Cold, Retained, RootProofs, Automatic };
 +
 +struct Options
 +{
-+    Mode mode = Mode::RootProofs;
++    // Automatic adds root certificates above 256 layouts, or from 64 layouts
++    // when at most seven tricks remain. Shape ordering starts above 256.
++    // Explicit cash bounds opt in to the root driver even for small batches.
++    Mode mode = Mode::Automatic;
++    // Automatic chooses ordering; select an explicit mode to override it.
 +    bool sort_by_shape = false;
 +    bool abstract_cash_bounds = false;
 +    int memory_mb = 256;
