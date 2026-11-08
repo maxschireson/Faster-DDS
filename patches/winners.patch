@@ -1,0 +1,17 @@
+diff --git a/library/src/ab_search.cpp b/library/src/ab_search.cpp
+index a487262..3b49c4c 100644
+--- a/library/src/ab_search.cpp
++++ b/library/src/ab_search.cpp
+@@ -829,6 +829,12 @@ void make_3(
+     {
+         if (data.play_count[st])
+         {
++            // Low plays do not change either cached high card. They need
++            // neither a rank-table load nor a winner undo record.
++            const unsigned tracked = bit_map_rank[posPoint->winner[st].rank] |
++                bit_map_rank[posPoint->second_best[st].rank];
++            if ((posPoint->aggr[st] & tracked) == tracked)
++                continue;
+             int n = wp->number;
+             wp->winner[n].suit = st;
+             wp->winner[n].winnerRank = posPoint->winner[st].rank;

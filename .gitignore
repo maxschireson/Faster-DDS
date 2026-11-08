@@ -1,0 +1,48 @@
+# Generated experiment data and logs
+/results/
+/my_results/
+/corpora/
+/data/
+/datasets/
+/logs/
+/test_results.txt
+*.log
+*.csv
+*.jsonl
+*.pbn
+# Deliberate small test fixtures may be versioned.
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.jsonl
+!tests/fixtures/**/*.pbn
+
+# Python and native build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+bin/
+bazel-*
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+.pytest_cache/
+.coverage
+
+# External model weights and packaged outputs
+*.pt
+*.pth
+*.onnx
+*.keras
+*.h5
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+.DS_Store

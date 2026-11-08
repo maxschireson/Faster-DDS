@@ -1,0 +1,228 @@
+diff --git a/benchmarks/BUILD.bazel b/benchmarks/BUILD.bazel
+index 1543f67..dad4208 100644
+--- a/benchmarks/BUILD.bazel
++++ b/benchmarks/BUILD.bazel
+@@ -1,6 +1,15 @@
+ load("//:CPPVARIABLES.bzl", "DDS_CPPOPTS", "DDS_LINKOPTS", "DDS_LOCAL_DEFINES")
+ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ 
++cc_binary(
++    name = "kernel_benchmark",
++    srcs = ["kernel_benchmark.cpp"],
++    copts = DDS_CPPOPTS,
++    linkopts = DDS_LINKOPTS,
++    local_defines = DDS_LOCAL_DEFINES,
++    deps = ["//library/src:dds"],
++)
++
+ # Reader + replay engine for recorded DDS workloads. Split from the CLI so the
+ # parsing and result-canonicalization logic can be unit tested.
+ cc_library(
+diff --git a/library/src/api/dds_data_types.hpp b/library/src/api/dds_data_types.hpp
+index a966e0b..b672e4c 100644
+--- a/library/src/api/dds_data_types.hpp
++++ b/library/src/api/dds_data_types.hpp
+@@ -361,9 +361,10 @@ struct AbsRankType // 2 bytes
+  * Contains absolute rank information for all possible card positions
+  * across all suits. Used for quick lookup during position analysis.
+  */
+-struct RelRanksType // 120 bytes
++struct RelRanksType // 32 bytes; only the three highest ranks are consumed.
+ {
+-    AbsRankType abs_rank[15][DDS_SUITS];  ///< Rank information indexed by position and suit
++    static constexpr int StoredRanks = 3;
++    AbsRankType abs_rank[StoredRanks + 1][DDS_SUITS];  ///< Rank information indexed by position and suit
+ };
+ 
+ /**
+diff --git a/library/src/init.cpp b/library/src/init.cpp
+index 6b0acf9..c338161 100644
+--- a/library/src/init.cpp
++++ b/library/src/init.cpp
+@@ -241,7 +241,7 @@ void SetDealTables(
+ 
+     for (int s = 0; s < DDS_SUITS; s++)
+     {
+-        for (int ord = 1; ord <= 13; ord++)
++        for (int ord = 1; ord <= RelRanksType::StoredRanks; ord++)
+         {
+             thrp->rel[0].abs_rank[ord][s].hand = -1;
+             thrp->rel[0].abs_rank[ord][s].rank = 0;
+@@ -285,7 +285,7 @@ void SetDealTables(
+         thrp->rel[aggr] = thrp->rel[aggr ^ topBitRank];
+         relp = &thrp->rel[aggr];
+ 
+-        int weight = count_table[aggr];
++        int weight = std::min(count_table[aggr], RelRanksType::StoredRanks);
+         for (int c = weight; c >= 2; c--)
+         {
+             for (int s = 0; s < DDS_SUITS; s++)
+diff --git a/library/src/system/thread_data.hpp b/library/src/system/thread_data.hpp
+index 3047964..edf5cb9 100644
+--- a/library/src/system/thread_data.hpp
++++ b/library/src/system/thread_data.hpp
+@@ -70,7 +70,7 @@ struct ThreadData
+     uint64_t tt_hit_count = 0;
+ 
+     // Constant for a given hand.
+-    // 960 KB
++    // 256 KiB
+     RelRanksType rel[8192];
+ 
+     // Deferred TT configuration for context-owned construction
+@@ -123,4 +123,4 @@ struct ThreadData
+ };
+ 
+ 
+-#endif // DDS_THREAD_DATA_H
+\ No newline at end of file
++#endif // DDS_THREAD_DATA_H
+diff --git a/library/tests/ab_search/BUILD.bazel b/library/tests/ab_search/BUILD.bazel
+index 48433aa..2aaec62 100644
+--- a/library/tests/ab_search/BUILD.bazel
++++ b/library/tests/ab_search/BUILD.bazel
+@@ -1,6 +1,14 @@
+ load("@rules_cc//cc:defs.bzl", "cc_test")
+ load("//:CPPVARIABLES.bzl", "DDS_CPPOPTS")
+ 
++cc_test(
++    name = "kernel_optimizations_test",
++    size = "small",
++    srcs = ["kernel_optimizations_test.cpp"],
++    deps = ["//library/src:testable_dds", "@googletest//:gtest_main"],
++    copts = DDS_CPPOPTS,
++)
++
+ cc_test(
+     name = "make_undo_test",
+     size = "small",
+diff --git a/library/tests/heuristic_sorting/test_utils.cpp b/library/tests/heuristic_sorting/test_utils.cpp
+index d3b1e75..a9c9fc1 100644
+--- a/library/tests/heuristic_sorting/test_utils.cpp
++++ b/library/tests/heuristic_sorting/test_utils.cpp
+@@ -125,7 +125,7 @@ void init_rel_and_track(const Pos& tpos, RelRanksType* rel_table /* size 8192 as
+ 
+     // Initialize rel_table[0]
+     for (int s = 0; s < DDS_SUITS; s++) {
+-        for (int ord = 1; ord <= 13; ord++) {
++        for (int ord = 1; ord <= RelRanksType::StoredRanks; ord++) {
+             rel_table[0].abs_rank[ord][s].hand = -1;
+             rel_table[0].abs_rank[ord][s].rank = 0;
+         }
+@@ -156,7 +156,7 @@ void init_rel_and_track(const Pos& tpos, RelRanksType* rel_table /* size 8192 as
+         rel_table[aggr] = rel_table[aggr ^ topBitRank];
+         RelRanksType * relp = &rel_table[aggr];
+ 
+-        int weight = count_table[aggr];
++        int weight = std::min(count_table[aggr], RelRanksType::StoredRanks);
+         for (int c = weight; c >= 2; c--) {
+             for (int s = 0; s < DDS_SUITS; s++) {
+                 relp->abs_rank[c][s].hand = relp->abs_rank[c - 1][s].hand;
+diff --git a/benchmarks/kernel_benchmark.cpp b/benchmarks/kernel_benchmark.cpp
+new file mode 100644
+index 0000000..8545b94
+--- /dev/null
++++ b/benchmarks/kernel_benchmark.cpp
+@@ -0,0 +1,62 @@
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include <api/solve_board.hpp>
++
++auto main(int argc, char** argv) -> int
++{
++    const int count = argc > 1 ? std::stoi(argv[1]) : 200;
++    const unsigned seed = argc > 2 ? std::stoul(argv[2]) : 5197319;
++    const int requested_cards = argc > 3 ? std::stoi(argv[3]) : 13;
++    const int solutions = argc > 4 ? std::stoi(argv[4]) : 1;
++    std::mt19937 rng(seed);
++    SolverContext ctx;
++    (void)ctx.trans_table();
++    std::cout << "deal,strain,cards,first,nanoseconds,trick_nodes,score,signature\n";
++    for (int deal_index = 0; deal_index < count; ++deal_index) {
++        std::array<int, 52> deck;
++        std::iota(deck.begin(), deck.end(), 0);
++        std::shuffle(deck.begin(), deck.end(), rng);
++        Deal deal{};
++        deal.first = deal_index % 4;
++        const int cards = requested_cards == 0 ? 3 + deal_index % 7 : requested_cards;
++        for (int hand = 0; hand < 4; ++hand)
++            for (int index = 0; index < cards; ++index) {
++                const int card = deck[13 * hand + index];
++                deal.remainCards[hand][card / 13] |= 1u << (card % 13 + 2);
++            }
++        for (int strain = 0; strain < 5; ++strain) {
++            deal.trump = strain;
++            ctx.reset_for_solve(); // Cold search cache; retain the allocated context.
++            FutureTricks result{};
++            const auto start = std::chrono::steady_clock::now();
++            const int rc = solve_board(ctx, deal, -1, solutions, 1, &result);
++            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now() - start).count();
++            if (rc != RETURN_NO_FAULT) throw std::runtime_error("DDS returned " + std::to_string(rc));
++            std::vector<std::pair<int, int>> scores;
++            if (solutions == 3) {
++                for (int index = 0; index < result.cards; ++index) {
++                    scores.emplace_back(15 * result.suit[index] + result.rank[index], result.score[index]);
++                    for (int rank = 2; rank <= 14; ++rank)
++                        if (result.equals[index] & (1 << rank))
++                            scores.emplace_back(15 * result.suit[index] + rank, result.score[index]);
++                }
++                std::sort(scores.begin(), scores.end());
++            }
++            std::cout << deal_index << ',' << strain << ',' << cards << ',' << deal.first << ','
++                      << elapsed << ',' << result.nodes << ',' << result.score[0] << ',';
++            for (const auto& [card, score] : scores) std::cout << card << ':' << score << ';';
++            std::cout << '\n';
++        }
++        std::cout.flush();
++    }
++}
+diff --git a/library/tests/ab_search/kernel_optimizations_test.cpp b/library/tests/ab_search/kernel_optimizations_test.cpp
+new file mode 100644
+index 0000000..8460c1d
+--- /dev/null
++++ b/library/tests/ab_search/kernel_optimizations_test.cpp
+@@ -0,0 +1,34 @@
++#include <algorithm>
++
++#include <gtest/gtest.h>
++
++#include <init.hpp>
++#include <lookup_tables/lookup_tables.hpp>
++#include <solver_context/solver_context.hpp>
++
++TEST(CompactRanks, FitsWithin256KiBPerContext)
++{
++    EXPECT_LE(8192 * sizeof(RelRanksType), 256u * 1024u);
++}
++
++TEST(CompactRanks, TopThreeAgreeWithIndependentScanForEveryMask)
++{
++    SolverContext ctx;
++    auto* thr = ctx.thread_ptr();
++    for (int suit = 0; suit < 4; ++suit)
++        for (int rank = 2; rank <= 14; ++rank)
++            thr->suit[(rank + suit) % 4][suit] |= bit_map_rank[rank];
++    SetDealTables(ctx);
++    for (int mask = 0; mask < 8192; ++mask) {
++        for (int suit = 0; suit < 4; ++suit) {
++            int cursor = 14;
++            for (int ordinal = 1; ordinal <= 3; ++ordinal) {
++                while (cursor >= 2 && !(mask & bit_map_rank[cursor])) --cursor;
++                const auto card = thr->rel[mask].abs_rank[ordinal][suit];
++                ASSERT_EQ(card.rank, cursor >= 2 ? cursor : 0);
++                ASSERT_EQ(card.hand, cursor >= 2 ? (cursor + suit) % 4 : -1);
++                --cursor;
++            }
++        }
++    }
++}

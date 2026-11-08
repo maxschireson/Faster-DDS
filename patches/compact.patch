@@ -1,0 +1,81 @@
+diff --git a/library/src/api/dds_data_types.hpp b/library/src/api/dds_data_types.hpp
+index a966e0b..b672e4c 100644
+--- a/library/src/api/dds_data_types.hpp
++++ b/library/src/api/dds_data_types.hpp
+@@ -361,9 +361,10 @@ struct AbsRankType // 2 bytes
+  * Contains absolute rank information for all possible card positions
+  * across all suits. Used for quick lookup during position analysis.
+  */
+-struct RelRanksType // 120 bytes
++struct RelRanksType // 32 bytes; only the three highest ranks are consumed.
+ {
+-    AbsRankType abs_rank[15][DDS_SUITS];  ///< Rank information indexed by position and suit
++    static constexpr int StoredRanks = 3;
++    AbsRankType abs_rank[StoredRanks + 1][DDS_SUITS];  ///< Rank information indexed by position and suit
+ };
+ 
+ /**
+diff --git a/library/src/init.cpp b/library/src/init.cpp
+index 6b0acf9..c338161 100644
+--- a/library/src/init.cpp
++++ b/library/src/init.cpp
+@@ -241,7 +241,7 @@ void SetDealTables(
+ 
+     for (int s = 0; s < DDS_SUITS; s++)
+     {
+-        for (int ord = 1; ord <= 13; ord++)
++        for (int ord = 1; ord <= RelRanksType::StoredRanks; ord++)
+         {
+             thrp->rel[0].abs_rank[ord][s].hand = -1;
+             thrp->rel[0].abs_rank[ord][s].rank = 0;
+@@ -285,7 +285,7 @@ void SetDealTables(
+         thrp->rel[aggr] = thrp->rel[aggr ^ topBitRank];
+         relp = &thrp->rel[aggr];
+ 
+-        int weight = count_table[aggr];
++        int weight = std::min(count_table[aggr], RelRanksType::StoredRanks);
+         for (int c = weight; c >= 2; c--)
+         {
+             for (int s = 0; s < DDS_SUITS; s++)
+diff --git a/library/src/system/thread_data.hpp b/library/src/system/thread_data.hpp
+index 3047964..edf5cb9 100644
+--- a/library/src/system/thread_data.hpp
++++ b/library/src/system/thread_data.hpp
+@@ -70,7 +70,7 @@ struct ThreadData
+     uint64_t tt_hit_count = 0;
+ 
+     // Constant for a given hand.
+-    // 960 KB
++    // 256 KiB
+     RelRanksType rel[8192];
+ 
+     // Deferred TT configuration for context-owned construction
+@@ -123,4 +123,4 @@ struct ThreadData
+ };
+ 
+ 
+-#endif // DDS_THREAD_DATA_H
+\ No newline at end of file
++#endif // DDS_THREAD_DATA_H
+diff --git a/library/tests/heuristic_sorting/test_utils.cpp b/library/tests/heuristic_sorting/test_utils.cpp
+index d3b1e75..a9c9fc1 100644
+--- a/library/tests/heuristic_sorting/test_utils.cpp
++++ b/library/tests/heuristic_sorting/test_utils.cpp
+@@ -125,7 +125,7 @@ void init_rel_and_track(const Pos& tpos, RelRanksType* rel_table /* size 8192 as
+ 
+     // Initialize rel_table[0]
+     for (int s = 0; s < DDS_SUITS; s++) {
+-        for (int ord = 1; ord <= 13; ord++) {
++        for (int ord = 1; ord <= RelRanksType::StoredRanks; ord++) {
+             rel_table[0].abs_rank[ord][s].hand = -1;
+             rel_table[0].abs_rank[ord][s].rank = 0;
+         }
+@@ -156,7 +156,7 @@ void init_rel_and_track(const Pos& tpos, RelRanksType* rel_table /* size 8192 as
+         rel_table[aggr] = rel_table[aggr ^ topBitRank];
+         RelRanksType * relp = &rel_table[aggr];
+ 
+-        int weight = count_table[aggr];
++        int weight = std::min(count_table[aggr], RelRanksType::StoredRanks);
+         for (int c = weight; c >= 2; c--) {
+             for (int s = 0; s < DDS_SUITS; s++) {
+                 relp->abs_rank[c][s].hand = relp->abs_rank[c - 1][s].hand;

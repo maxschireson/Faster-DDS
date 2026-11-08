@@ -1,0 +1,296 @@
+diff --git a/benchmarks/BUILD.bazel b/benchmarks/BUILD.bazel
+index 1543f67..dad4208 100644
+--- a/benchmarks/BUILD.bazel
++++ b/benchmarks/BUILD.bazel
+@@ -1,6 +1,15 @@
+ load("//:CPPVARIABLES.bzl", "DDS_CPPOPTS", "DDS_LINKOPTS", "DDS_LOCAL_DEFINES")
+ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ 
++cc_binary(
++    name = "kernel_benchmark",
++    srcs = ["kernel_benchmark.cpp"],
++    copts = DDS_CPPOPTS,
++    linkopts = DDS_LINKOPTS,
++    local_defines = DDS_LOCAL_DEFINES,
++    deps = ["//library/src:dds"],
++)
++
+ # Reader + replay engine for recorded DDS workloads. Split from the CLI so the
+ # parsing and result-canonicalization logic can be unit tested.
+ cc_library(
+diff --git a/library/tests/ab_search/BUILD.bazel b/library/tests/ab_search/BUILD.bazel
+index 48433aa..2aaec62 100644
+--- a/library/tests/ab_search/BUILD.bazel
++++ b/library/tests/ab_search/BUILD.bazel
+@@ -1,6 +1,14 @@
+ load("@rules_cc//cc:defs.bzl", "cc_test")
+ load("//:CPPVARIABLES.bzl", "DDS_CPPOPTS")
+ 
++cc_test(
++    name = "kernel_optimizations_test",
++    size = "small",
++    srcs = ["kernel_optimizations_test.cpp"],
++    deps = ["//library/src:testable_dds", "@googletest//:gtest_main"],
++    copts = DDS_CPPOPTS,
++)
++
+ cc_test(
+     name = "make_undo_test",
+     size = "small",
+diff --git a/benchmarks/kernel_benchmark.cpp b/benchmarks/kernel_benchmark.cpp
+new file mode 100644
+index 0000000..8545b94
+--- /dev/null
++++ b/benchmarks/kernel_benchmark.cpp
+@@ -0,0 +1,62 @@
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include <api/solve_board.hpp>
++
++auto main(int argc, char** argv) -> int
++{
++    const int count = argc > 1 ? std::stoi(argv[1]) : 200;
++    const unsigned seed = argc > 2 ? std::stoul(argv[2]) : 5197319;
++    const int requested_cards = argc > 3 ? std::stoi(argv[3]) : 13;
++    const int solutions = argc > 4 ? std::stoi(argv[4]) : 1;
++    std::mt19937 rng(seed);
++    SolverContext ctx;
++    (void)ctx.trans_table();
++    std::cout << "deal,strain,cards,first,nanoseconds,trick_nodes,score,signature\n";
++    for (int deal_index = 0; deal_index < count; ++deal_index) {
++        std::array<int, 52> deck;
++        std::iota(deck.begin(), deck.end(), 0);
++        std::shuffle(deck.begin(), deck.end(), rng);
++        Deal deal{};
++        deal.first = deal_index % 4;
++        const int cards = requested_cards == 0 ? 3 + deal_index % 7 : requested_cards;
++        for (int hand = 0; hand < 4; ++hand)
++            for (int index = 0; index < cards; ++index) {
++                const int card = deck[13 * hand + index];
++                deal.remainCards[hand][card / 13] |= 1u << (card % 13 + 2);
++            }
++        for (int strain = 0; strain < 5; ++strain) {
++            deal.trump = strain;
++            ctx.reset_for_solve(); // Cold search cache; retain the allocated context.
++            FutureTricks result{};
++            const auto start = std::chrono::steady_clock::now();
++            const int rc = solve_board(ctx, deal, -1, solutions, 1, &result);
++            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now() - start).count();
++            if (rc != RETURN_NO_FAULT) throw std::runtime_error("DDS returned " + std::to_string(rc));
++            std::vector<std::pair<int, int>> scores;
++            if (solutions == 3) {
++                for (int index = 0; index < result.cards; ++index) {
++                    scores.emplace_back(15 * result.suit[index] + result.rank[index], result.score[index]);
++                    for (int rank = 2; rank <= 14; ++rank)
++                        if (result.equals[index] & (1 << rank))
++                            scores.emplace_back(15 * result.suit[index] + rank, result.score[index]);
++                }
++                std::sort(scores.begin(), scores.end());
++            }
++            std::cout << deal_index << ',' << strain << ',' << cards << ',' << deal.first << ','
++                      << elapsed << ',' << result.nodes << ',' << result.score[0] << ',';
++            for (const auto& [card, score] : scores) std::cout << card << ':' << score << ';';
++            std::cout << '\n';
++        }
++        std::cout.flush();
++    }
++}
+diff --git a/library/tests/ab_search/kernel_optimizations_test.cpp b/library/tests/ab_search/kernel_optimizations_test.cpp
+new file mode 100644
+index 0000000..c887de7
+--- /dev/null
++++ b/library/tests/ab_search/kernel_optimizations_test.cpp
+@@ -0,0 +1,183 @@
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <memory>
++#include <random>
++
++#include <gtest/gtest.h>
++
++#include <ab_search.hpp>
++#include <init.hpp>
++#include <lookup_tables/lookup_tables.hpp>
++#include <quick_tricks.hpp>
++#include <solver_context/solver_context.hpp>
++
++TEST(CompactRanks, FitsWithin256KiBPerContext)
++{
++    EXPECT_LE(8192 * sizeof(RelRanksType), 256u * 1024u);
++}
++
++TEST(CompactRanks, TopThreeAgreeWithIndependentScanForEveryMask)
++{
++    SolverContext ctx;
++    auto* thr = ctx.thread_ptr();
++    for (int suit = 0; suit < 4; ++suit)
++        for (int rank = 2; rank <= 14; ++rank)
++            thr->suit[(rank + suit) % 4][suit] |= bit_map_rank[rank];
++    SetDealTables(ctx);
++    for (int mask = 0; mask < 8192; ++mask) {
++        for (int suit = 0; suit < 4; ++suit) {
++            int cursor = 14;
++            for (int ordinal = 1; ordinal <= 3; ++ordinal) {
++                while (cursor >= 2 && !(mask & bit_map_rank[cursor])) --cursor;
++                const auto card = thr->rel[mask].abs_rank[ordinal][suit];
++                ASSERT_EQ(card.rank, cursor >= 2 ? cursor : 0);
++                ASSERT_EQ(card.hand, cursor >= 2 ? (cursor + suit) % 4 : -1);
++                --cursor;
++            }
++        }
++    }
++}
++
++TEST(WinnerUpdates, LowCardsLeaveHighCardsAndUndoLogUntouched)
++{
++    SolverContext ctx;
++    auto* thr = ctx.thread_ptr();
++    for (int hand = 0; hand < 4; ++hand)
++        thr->suit[hand][0] = bit_map_rank[2 + hand];
++    thr->suit[0][0] |= bit_map_rank[14];
++    thr->suit[1][0] |= bit_map_rank[13];
++    thr->suit[2][0] |= bit_map_rank[6];
++    thr->suit[3][0] |= bit_map_rank[7];
++    SetDeal(ctx.thread());
++    SetDealTables(ctx);
++    Deal deal{};
++    auto& pos = thr->lookAheadPos;
++    InitWinners(deal, pos, ctx.thread());
++    const auto before = pos;
++    constexpr int depth = 4;
++    pos.first[depth] = 0;
++    MoveType moves[4]{};
++    for (int hand = 0; hand < 4; ++hand) {
++        moves[hand] = {0, 2 + hand, 0, 0};
++        ctx.move_gen().make_specific(moves[hand], 1, hand);
++    }
++    make_0(&pos, depth, &moves[0]);
++    make_1(&pos, depth - 1, &moves[1]);
++    make_2(&pos, depth - 2, &moves[2]);
++    unsigned short winning_ranks[4]{};
++    make_3(&pos, winning_ranks, depth - 3, &moves[3], ctx);
++    EXPECT_EQ(ctx.search().winners(1).number, 0);
++    EXPECT_EQ(pos.winner[0].rank, 14);
++    EXPECT_EQ(pos.second_best[0].rank, 13);
++    undo_0(&pos, depth - 3, moves[3], ctx);
++    undo_3(&pos, depth - 2, moves[2]);
++    undo_2(&pos, depth - 1, moves[1]);
++    undo_1(&pos, depth, moves[0]);
++    EXPECT_EQ(std::memcmp(pos.rank_in_suit, before.rank_in_suit, sizeof(pos.rank_in_suit)), 0);
++    EXPECT_EQ(std::memcmp(pos.winner, before.winner, sizeof(pos.winner)), 0);
++    EXPECT_EQ(std::memcmp(pos.second_best, before.second_best, sizeof(pos.second_best)), 0);
++}
++
++class CashingRuns : public ::testing::Test
++{
++protected:
++    SolverContext ctx;
++    int hand_size = 5;
++
++    void place(int hand, int suit, std::initializer_list<int> ranks)
++    {
++        for (const int rank : ranks) ctx.thread_ptr()->suit[hand][suit] |= bit_map_rank[rank];
++    }
++
++    void arrange(bool gap = false)
++    {
++        if (gap) {
++            place(0, 0, {14, 13, 11, 9, 2});
++            place(1, 0, {12, 10, 8});
++        } else {
++            place(0, 0, {14, 13, 12, 11, 2});
++            place(1, 0, {10, 9, 8});
++        }
++        place(2, 0, {3});
++        place(3, 0, {7, 6, 5, 4});
++        place(1, 1, {14, 2});
++        place(2, 1, {13, 12, 11, 10});
++        place(3, 1, {3});
++    }
++
++    auto check(int target, int trump = DDS_NOTRUMP, bool leading_max = true) -> bool
++    {
++        SetDeal(ctx.thread());
++        SetDealTables(ctx);
++        Deal deal{};
++        deal.trump = trump;
++        auto& pos = ctx.thread_ptr()->lookAheadPos;
++        InitWinners(deal, pos, ctx.thread());
++        for (int hand = 0; hand < 4; ++hand)
++            ctx.search().node_type_store(hand) = ((hand % 2 == 0) == leading_max) ? MAXNODE : MINNODE;
++        bool result = false;
++        const int value = QuickTricks(pos, 0, 4 * (hand_size - 1), target, trump, result, ctx);
++        return result && value > 0;
++    }
++};
++
++TEST_F(CashingRuns, CreditsFourUninterruptedWinners)
++{
++    arrange();
++    EXPECT_TRUE(check(4));
++    const auto& pos = ctx.thread_ptr()->lookAheadPos;
++    EXPECT_EQ(pos.win_ranks[16][0], bit_map_rank[14] | bit_map_rank[13] |
++        bit_map_rank[12] | bit_map_rank[11]);
++    for (int suit = 1; suit < 4; ++suit)
++        EXPECT_EQ(pos.win_ranks[16][suit], 0);
++}
++
++TEST_F(CashingRuns, DoesNotCreditTheFifthCard)
++{
++    arrange();
++    EXPECT_FALSE(check(5));
++}
++
++TEST_F(CashingRuns, OpponentsQueenStopsTheRun)
++{
++    arrange(true);
++    EXPECT_FALSE(check(4));
++}
++
++TEST_F(CashingRuns, OpponentTrumpsPreventNotrumpShortcut)
++{
++    arrange();
++    EXPECT_FALSE(check(4, 1));
++}
++
++TEST_F(CashingRuns, AlsoProvesTheMinimizingSidesFourTricks)
++{
++    arrange();
++    EXPECT_TRUE(check(2, DDS_NOTRUMP, false));
++}
++
++TEST_F(CashingRuns, RemovedRanksDoNotBreakARun)
++{
++    hand_size = 4;
++    place(0, 0, {14, 13, 11, 2});
++    place(1, 0, {10, 9, 8});
++    place(1, 1, {14});
++    place(2, 0, {3});
++    place(2, 1, {13, 12, 11});
++    place(3, 0, {7, 6, 5, 4});
++    EXPECT_TRUE(check(3));
++}
++
++TEST_F(CashingRuns, CombinesOwnWinnersAcrossSuitsWithoutPartnerEntries)
++{
++    place(0, 0, {14, 13, 11});
++    place(0, 1, {14, 13});
++    place(1, 0, {10, 9, 8});
++    place(1, 1, {12, 11});
++    place(2, 0, {3});
++    place(2, 1, {10, 9, 8, 7});
++    place(3, 0, {7, 6, 5, 4});
++    place(3, 1, {6});
++    EXPECT_TRUE(check(5));
++}

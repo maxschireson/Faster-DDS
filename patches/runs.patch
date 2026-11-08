@@ -1,0 +1,38 @@
+diff --git a/library/src/quick_tricks.cpp b/library/src/quick_tricks.cpp
+index b082062..0fd957b 100644
+--- a/library/src/quick_tricks.cpp
++++ b/library/src/quick_tricks.cpp
+@@ -606,6 +606,33 @@ int QuickTricks(
+         }
+     }
+ 
++    // A conservative fallback: cash only uninterrupted top cards held by
++    // the hand already on lead, at notrump. No entry to partner is needed,
++    // and discards cannot interrupt the run. Keep this behind the existing
++    // cheap cutoffs, and do not mix its count with partner's quick tricks.
++    if (trump == DDS_NOTRUMP && qtricks > 0 && cutoff > 2)
++    {
++        unsigned short run_ranks[DDS_SUITS] = {};
++        int run_tricks = 0;
++        for (int s = 0; s < DDS_SUITS; ++s)
++        {
++            if (winner[s].hand != hand)
++                continue;
++            const unsigned own = ris[hand][s];
++            const unsigned others = tpos.aggr[s] ^ own;
++            const unsigned below = others == 0 ? 0u :
++                (static_cast<unsigned>(bit_map_rank[highest_rank[others]]) << 1) - 1u;
++            run_ranks[s] = static_cast<unsigned short>(own & ~below);
++            run_tricks += count_table[run_ranks[s]];
++            if (run_tricks >= cutoff)
++            {
++                for (int suit_index = 0; suit_index < DDS_SUITS; ++suit_index)
++                    tpos.win_ranks[depth][suit_index] = run_ranks[suit_index];
++                return run_tricks;
++            }
++        }
++    }
++
+     result = false;
+     return qtricks;
+ }

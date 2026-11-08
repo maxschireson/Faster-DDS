@@ -1,0 +1,19 @@
+{
+  "date": "2026-11-08",
+  "upstream": "https://github.com/dds-bridge/dds",
+  "commit": "0f969b86a4841f438fd0cdff2924c4f2404abf6a",
+  "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "cpu_affinity_used": 0,
+  "flags": [
+    "-c opt",
+    "--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc_toolchains//:all",
+    "--copt=-march=native",
+    "--copt=-flto",
+    "--linkopt=-flto"
+  ],
+  "primary_seed": 5197319,
+  "holdout_seed": 2077111,
+  "small_seed": 821773,
+  "timing_note": "serial; one pinned CPU; context creation and cache reset excluded, solve_board included; same compiler options in all variants"
+}
