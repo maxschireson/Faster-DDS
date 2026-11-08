@@ -4,7 +4,7 @@ Fixed North/South hands, multiple East/West allocations, validation before searc
 and reusable DDS proofs. This directory contains source and reproducible scripts;
 raw measurements and logs are distributed separately.
 
-- [Performance report](PERFORMANCE.md): full deals, seven- and ten-card positions,
+- [Performance report](PERFORMANCE.md): full deals, seven- through ten-card positions,
   small batches, controls, limitations and reproduction commands.
 - [Design and API](DESIGN.md): validation, cache lifetime and proof conditions.
 - [Source patch](related_batch.patch): apply after `patches/recommended.patch`
