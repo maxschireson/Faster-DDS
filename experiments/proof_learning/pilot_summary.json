@@ -1,0 +1,89 @@
+{
+  "parameters": 34152,
+  "architecture": [
+    427,
+    64,
+    104
+  ],
+  "cpu_seconds": 1.135190116,
+  "family_splits": {
+    "6c702375339fd224ef78616e6af2e83d35c290095d6b05972d2d4a2ade0ce690": "test",
+    "fb95d49ee936dda4e7180f6a80608eab3c8a6dd6fe0e478dca5fa3114ea5dc4d": "validation",
+    "d326747095d49de451ba3053641a0ecf58708662d6ecb8c0bf8ef31ccd31f27d": "train",
+    "757a11c89bd80af681260f30b46fbee05c2c230628a76d4b57fb07efc9a86baa": "train",
+    "e54b6ba5956a227bcfb756126eba80e75806719869f0717e82a566df63d6d2e3": "train",
+    "25b8b0357ee20eda4af84a8bee5bb22b6b95bd6cc84ad79dc7ff05e8af3c19d4": "train",
+    "a23c6a92696c72b24cc85048c2f7133d1266d1026d465d73b665fc4085b462f4": "train",
+    "2cc18c82bdcdd1c7dff361b2ac52c08ebb856b7619b6da8e97149213c7486250": "train",
+    "6328c5d20a662c0c6ad2bb30ab5e52816dd3d3b9371766922f6c6c11f3c4da90": "train",
+    "b865add15f4bd579a02439ba066cd39ed1b268ab073abaf8db3107f03b477b11": "train"
+  },
+  "input_rows": 6547,
+  "unique_rows": 6547,
+  "metrics": {
+    "train": {
+      "rows": 5263,
+      "eligible_cutoffs": 2451,
+      "first_success_rate": {
+        "stock": 0.8714810281517748,
+        "model": 0.7380660954712362
+      },
+      "isolated_child_node_cost": {
+        "stock": 33917000,
+        "model": 31628118,
+        "oracle": 23263893
+      },
+      "proxy_speedup": 1.0723685803878689
+    },
+    "validation": {
+      "rows": 721,
+      "eligible_cutoffs": 350,
+      "first_success_rate": {
+        "stock": 0.8485714285714285,
+        "model": 0.7628571428571429
+      },
+      "isolated_child_node_cost": {
+        "stock": 1214717,
+        "model": 1251101,
+        "oracle": 886164
+      },
+      "proxy_speedup": 0.9709184150600152
+    },
+    "test": {
+      "rows": 563,
+      "eligible_cutoffs": 263,
+      "first_success_rate": {
+        "stock": 0.8973384030418251,
+        "model": 0.8326996197718631
+      },
+      "isolated_child_node_cost": {
+        "stock": 1634792,
+        "model": 1602838,
+        "oracle": 1204983
+      },
+      "proxy_speedup": 1.0199358887173875
+    }
+  },
+  "limitation": "Isolated child-cost proxy; requires exact whole-solve timing before promotion.",
+  "whole_solve_test": {
+    "baseline_seconds": 0.532414,
+    "model_seconds": 0.542582,
+    "baseline_nodes": 4221579,
+    "model_nodes": 4218003,
+    "model_calls": 300,
+    "roots": 100,
+    "speedup": 0.9812599754507154,
+    "node_speedup": 1.0008477945606014,
+    "all_moves_equal": true
+  },
+  "candidate_labels": 27128,
+  "native_choice_us": [
+    1.2884,
+    1.2309
+  ],
+  "source_trace_sha256": "c0486cda465b7847e336190873825f7b6b23b177008e97320b6593080efd8f7e",
+  "correctness": {
+    "independent_labels_checked": 425,
+    "all_collected_and_evaluated_move_scores_equal": true
+  }
+}

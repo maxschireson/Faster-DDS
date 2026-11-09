@@ -1,0 +1,50 @@
+{
+  "all": {
+    "baseline_seconds": 13.874971,
+    "model_seconds": 14.056037,
+    "baseline_nodes": 102971127,
+    "model_nodes": 103184892,
+    "model_calls": 1197,
+    "roots": 1000,
+    "time_factor": 0.9871182752293552,
+    "node_factor": 0.997928330438142,
+    "all_moves_equal": true,
+    "strict_root_gate": true
+  },
+  "large": {
+    "baseline_seconds": 13.476601,
+    "model_seconds": 13.656572,
+    "baseline_nodes": 99677418,
+    "model_nodes": 99891183,
+    "model_calls": 1197,
+    "roots": 423,
+    "time_factor": 0.9868216562692307,
+    "node_factor": 0.9978600213394209,
+    "all_moves_equal": true,
+    "strict_root_gate": true
+  },
+  "small": {
+    "baseline_seconds": 0.39837,
+    "model_seconds": 0.399465,
+    "baseline_nodes": 3293709,
+    "model_nodes": 3293709,
+    "model_calls": 0,
+    "roots": 577,
+    "time_factor": 0.9972588336900604,
+    "node_factor": 1.0,
+    "all_moves_equal": true,
+    "strict_root_gate": true
+  },
+  "old_test_large": {
+    "baseline_seconds": 0.49855700000000003,
+    "model_seconds": 0.498275,
+    "baseline_nodes": 4162383,
+    "model_nodes": 4158807,
+    "model_calls": 204,
+    "roots": 68,
+    "time_factor": 1.00056595253625,
+    "node_factor": 1.0008598619748403,
+    "all_moves_equal": true,
+    "strict_root_gate": true
+  }
+}
