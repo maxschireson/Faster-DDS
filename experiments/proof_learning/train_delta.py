@@ -1,0 +1,119 @@
+"""Learn log whole-root work changes for DDS's second/third/fourth choices."""
+import argparse
+import json
+from pathlib import Path
+import numpy as np
+from pipeline import features, split_families
+
+
+def encode(row):
+    x = np.zeros(480, np.float32)
+    x[:427] = features(row['key'], row['stock_order'])
+    for i, c in enumerate(row['stock_order']):x[427 + c] = 1 / (i + 1)
+    x[479] = row['ply_from_root'] / 12
+    return x
+
+
+def partition(rows, splits):
+    unique = {}; owners = {}
+    for r in rows:
+        unique.setdefault((r['family'], r['root'], r['decision_index']), r)
+        key = (tuple(r['key']), tuple(r['stock_order']))
+        owners.setdefault(key, set()).add(splits[r['family']])
+    groups = {s: [] for s in ['train', 'validation', 'test']}
+    removed = 0
+    for r in unique.values():
+        if len(owners[(tuple(r['key']), tuple(r['stock_order']))]) > 1:
+            removed += 1
+        else: groups[splits[r['family']]].append(r)
+    return groups, dict(duplicate_observations=len(rows)-len(unique), cross_split_rows=removed)
+
+
+def baseline_loss(*data):
+    model = initialize(0)
+    for w in model['w']: w.fill(0)
+    return loss_parts(model, *data)[0]
+
+
+def initialize(seed):
+    rng = np.random.default_rng(seed)
+    w = [rng.normal(0, np.sqrt(2 / 480), (480, 64)).astype(np.float32), np.zeros(64, np.float32),
+         rng.normal(0, 0.01, (64, 3)).astype(np.float32), np.full(3, 0.05, np.float32)]
+    return dict(w=w, m=[np.zeros_like(v) for v in w], v=[np.zeros_like(v) for v in w], t=0)
+
+
+def predict(model, x):
+    w, b, v, c = model['w']
+    return np.maximum(0, x @ w + b) @ v + c
+
+
+def loss_parts(model, x, y, mask, complete, weight):
+    h = np.maximum(0, x @ model['w'][0] + model['w'][1])
+    prediction = h @ model['w'][2] + model['w'][3]
+    delta = prediction - y
+    delta = np.where(complete, delta, np.minimum(delta, 0))
+    weights = mask * weight
+    denominator = max(float(weights.sum()), 1)
+    huber = np.where(abs(delta) <= 0.2, delta ** 2 / 2, 0.2 * (abs(delta) - 0.1))
+    return float((huber * weights).sum() / denominator), h, np.clip(delta, -0.2, 0.2) * weights / denominator
+
+
+def step(model, x, y, mask, complete, weight):
+    loss, h, dy = loss_parts(model, x, y, mask, complete, weight)
+    dh = (dy @ model['w'][2].T) * (h > 0)
+    gradients = [x.T @ dh, dh.sum(0), h.T @ dy, dy.sum(0)]
+    model['t'] += 1; t = model['t']
+    for w, m, v, g in zip(model['w'], model['m'], model['v'], gradients):
+        m *= 0.9; m += 0.1 * g; v *= 0.999; v += 0.001 * g * g
+        w -= 0.001 * (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - 0.999 ** t)) + 1e-8)
+    return loss
+
+
+def tensors(rows, scale):
+    x = np.stack([encode(r) for r in rows])
+    y, mask, complete = (np.zeros((len(rows), 3), np.float32) for _ in range(3))
+    for i, row in enumerate(rows):
+        for t in row['trials']:
+            if t['rank'] == 1:continue
+            c = t['rank'] - 2
+            y[i, c] = np.log(t['nodes'] / row['baseline_nodes'])
+            mask[i, c] = 1; complete[i, c] = t['complete']
+    weight = np.sqrt(np.asarray([r['baseline_nodes'] for r in rows], np.float32) / scale).clip(0.2, 5)[:, None]
+    return x, y, mask, complete, weight
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('dataset'); p.add_argument('output'); p.add_argument('--epochs', type=int, default=80)
+    args = p.parse_args()
+    rows = [json.loads(x) for x in Path(args.dataset).read_text().splitlines()]
+    splits = split_families(r['family'] for r in rows)
+    groups, deduplication = partition(rows, splits)
+    scale = np.median([r['baseline_nodes'] for r in groups['train']])
+    data = {s: tensors(rs, scale) for s, rs in groups.items()}
+    model = initialize(7411); rng = np.random.default_rng(7411)
+    history, best, best_w, best_epoch = [], float('inf'), None, 0
+    for epoch in range(args.epochs):
+        order = rng.permutation(len(groups['train']))
+        for i in range(0, len(order), 64):step(model, *(a[order[i:i + 64]] for a in data['train']))
+        val = loss_parts(model, *data['validation'])[0]
+        history.append(val)
+        if val < best:best, best_epoch, best_w = val, epoch + 1, [w.copy() for w in model['w']]
+    model['w'] = best_w
+    out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
+    with (out / 'delta.txt').open('w') as f:
+        f.write('DDS_DELTA_V1 480 64 3\n')
+        for w in model['w']:np.savetxt(f, w.reshape(1, -1), fmt='%.9g')
+    np.savez(out / 'delta.npz', **{f'w{i}': w for i, w in enumerate(model['w'])})
+    report = dict(parameters=sum(w.size for w in model['w']), best_epoch=best_epoch,
+                  deduplication=deduplication,
+                  family_splits=splits, rows={s:len(r) for s,r in groups.items()},
+                  selected_label_loss={s:loss_parts(model,*d)[0] for s,d in data.items()},
+                  baseline_label_loss={s:baseline_loss(*d) for s,d in data.items()},
+                  validation_history=history,
+                  warning='Labels may prioritize expensive states offline. These losses are not a causal runtime speedup; native whole-root evaluation is required.')
+    (out / 'training.json').write_text(json.dumps(report,indent=2))
+    print(json.dumps({k:v for k,v in report.items() if k != 'validation_history'},indent=2))
+
+
+if __name__ == '__main__':main()

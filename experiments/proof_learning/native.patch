@@ -15,10 +15,10 @@ index 1543f67..2b9709b 100644
 +)
 diff --git a/benchmarks/proof_learning.cpp b/benchmarks/proof_learning.cpp
 new file mode 100644
-index 0000000..9dd49f0
+index 0000000..f7f04e7
 --- /dev/null
 +++ b/benchmarks/proof_learning.cpp
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,531 @@
 +// Offline self-play scavenger. Every output remains an exact DDS result.
 +#include <proof_model.hpp>
 +#include <research_teacher.hpp>
@@ -211,11 +211,228 @@ index 0000000..9dd49f0
 +    }
 +}
 +
++struct Intervention
++{
++    const dds_research::Decision& decision;
++    int rank = 0;
++    std::uint64_t seen = 0;
++    int fired = 0;
++
++    static auto choose(const dds_research::Key& key, const MovePlyType& moves, void* context)
++        -> dds_research::Hint
++    {
++        auto& self = *static_cast<Intervention*>(context);
++        if (++self.seen != self.decision.visit_index) return {-1, 0, 0};
++        if (key != self.decision.key || moves.last + 1 != static_cast<int>(self.decision.moves.size()))
++            throw std::runtime_error("Counterfactual prefix changed before intervention");
++        for (int i = 0; i <= moves.last; ++i)
++            if (moves.move[i].suit != self.decision.moves[i].suit ||
++                moves.move[i].rank != self.decision.moves[i].rank)
++                throw std::runtime_error("Counterfactual stock order changed before intervention");
++        ++self.fired;
++        return self.decision.moves[self.rank];
++    }
++};
++
++auto intervene(const std::string& input_path, const std::string& output_path,
++               int levels = 3, int max_decisions = 4, bool cost_sample = false) -> void
++{
++    if (levels < 1 || levels > 12 || max_decisions < 1 || max_decisions > 64)
++        throw std::runtime_error("Invalid intervention sampling parameters");
++    std::ifstream input(input_path);
++    std::ofstream output(output_path);
++    if (!input || !output) throw std::runtime_error("Cannot open intervention files");
++    init_lookup_tables();
++    std::string family;
++    int root = 0, roots = 0;
++    while (input >> family >> root) {
++        dds_research::Key key{};
++        for (auto& word : key) if (!(input >> word)) throw std::runtime_error("Truncated intervention root");
++        if ((key[24] + 7) / 4 < 10) continue;
++        const auto deal = dds_research::deal_from_key(key);
++        dds_research::Research baseline;
++        baseline.learn = false;
++        baseline.collect_decisions = true;
++        baseline.decision_min_nodes = 0;
++        baseline.min_depth = std::max(0, static_cast<int>(key[24]) - levels + 1);
++        SolverContext base_context;
++        const auto reference = solve(base_context, deal, &baseline);
++        std::stable_sort(baseline.decisions.begin(), baseline.decisions.end(),
++            [cost_sample](const auto& a, const auto& b) {
++                return cost_sample ? a.cost > b.cost : a.visit_index < b.visit_index;
++            });
++        int selected = 0;
++        for (const auto& decision : baseline.decisions) {
++            // Cost selection is an OFFLINE labeling priority, never a model input
++            // or a deployable inference gate. Native evaluation must decide causally.
++            if (selected++ == max_decisions) break;
++            output << "{\"family\":\"" << family << "\",\"root\":" << root
++                << ",\"selection\":\"" << (cost_sample ? "offline_cost" : "first")
++                << "\",\"levels\":" << levels
++                << ",\"decision_index\":" << decision.visit_index << ",\"key\":[";
++            for (std::size_t i = 0; i < decision.key.size(); ++i) output << (i ? "," : "") << decision.key[i];
++            output << "],\"ply_from_root\":" << key[24] - decision.key[24]
++                << ",\"baseline_nodes\":" << baseline.nodes << ",\"stock_order\":[";
++            for (std::size_t i = 0; i < decision.moves.size(); ++i)
++                output << (i ? "," : "") << decision.moves[i].suit * 13 + decision.moves[i].rank - 2;
++            output << "],\"trials\":[";
++            const int count = std::min(4, static_cast<int>(decision.moves.size()));
++            for (int rank = 0; rank < count; ++rank) {
++                dds_research::Research trial;
++                trial.learn = false; trial.apply = true; trial.min_depth = baseline.min_depth;
++                trial.node_limit = std::max<std::uint64_t>(20000, 4 * baseline.nodes);
++                Intervention change{decision, rank};
++                trial.teacher_hook = &Intervention::choose; trial.teacher_context = &change;
++                bool complete = true;
++                const double start = cpu_seconds();
++                try {
++                    // A fresh context is discarded on budget exhaustion.
++                    SolverContext context;
++                    const auto result = solve(context, deal, &trial);
++                    if (scores(reference) != scores(result)) throw std::runtime_error("Intervention changed all-move scores");
++                } catch (const dds_research::SearchLimitExceeded&) { complete = false; }
++                const double elapsed = cpu_seconds() - start;
++                if (change.fired != 1) throw std::runtime_error("Intervention was not executed exactly once");
++                if (rank == 0 && (!complete || trial.nodes != baseline.nodes))
++                    throw std::runtime_error("Rank-one control changed search work");
++                output << (rank ? "," : "") << "{\"rank\":" << rank + 1
++                    << ",\"card\":" << decision.moves[rank].suit * 13 + decision.moves[rank].rank - 2
++                    << ",\"nodes\":" << trial.nodes << ",\"cpu_seconds\":" << elapsed
++                    << ",\"complete\":" << (complete ? "true" : "false")
++                    << ",\"all_moves_equal\":" << (complete ? "true" : "null")
++                    << ",\"interventions\":" << change.fired << '}';
++            }
++            output << "]}\n";
++        }
++        output.flush();
++        if (++roots % 25 == 0) std::cerr << "intervened on " << roots << " roots\n";
++    }
++}
++
++struct DeltaHook
++{
++    const dds_proof::DeltaModel& model;
++    int root_depth;
++    float threshold;
++    int calls = 0;
++    int deviations = 0;
++
++    static auto choose(const dds_research::Key& key, const MovePlyType& moves, void* context)
++        -> dds_research::Hint
++    {
++        auto& self = *static_cast<DeltaHook*>(context);
++        if (self.calls >= 64 || self.deviations) return {-1, 0, 0};
++        ++self.calls;
++        const auto hint = self.model.choose(key, moves, self.root_depth - key[24], self.threshold);
++        self.deviations += hint.suit >= 0;
++        return hint;
++    }
++};
++
++auto delta_infer(const std::string& model_path, const std::string& input_path,
++                 const std::string& output_path) -> void
++{
++    dds_proof::DeltaModel model(model_path);
++    std::ifstream input(input_path);
++    std::ofstream output(output_path);
++    if (!input || !output) throw std::runtime_error("Cannot open delta fixtures");
++    struct Case { dds_research::Key key{}; MovePlyType moves{}; int ply = 0; };
++    std::vector<Case> cases;
++    Case c;
++    while (input >> c.key[0]) {
++        for (std::size_t i = 1; i < c.key.size(); ++i)
++            if (!(input >> c.key[i])) throw std::runtime_error("Truncated delta key");
++        int count = 0;
++        if (!(input >> c.ply >> count) || count < 1 || count > 13)
++            throw std::runtime_error("Invalid delta move count");
++        c.moves.last = count - 1;
++        for (int i = 0; i < count; ++i) {
++            int card = 0;
++            if (!(input >> card) || card < 0 || card >= 52) throw std::runtime_error("Invalid delta card");
++            c.moves.move[i].suit = card / 13; c.moves.move[i].rank = card % 13 + 2;
++        }
++        const auto y = model.evaluate(dds_proof::delta_features(c.key, c.moves, c.ply));
++        output << '[' << std::setprecision(9) << y[0] << ',' << y[1] << ',' << y[2] << "]\n";
++        cases.push_back(c);
++    }
++    if (cases.empty()) throw std::runtime_error("No delta cases");
++    int checksum = 0;
++    const double start = cpu_seconds();
++    for (int repeat = 0; repeat < 100; ++repeat)
++        for (const auto& item : cases)
++            checksum += model.choose(item.key, item.moves, item.ply, -0.02f).rank;
++    output << "{\"microseconds_per_choice\":" << (cpu_seconds() - start) * 1e6 / (100 * cases.size())
++        << ",\"choices\":" << 100 * cases.size() << ",\"checksum\":" << checksum << "}\n";
++}
++
++auto evaluate_delta(const std::string& input_path, const std::string& output_path,
++                    const std::string& model_path, float threshold) -> void
++{
++    dds_proof::DeltaModel model(model_path);
++    std::ifstream input(input_path);
++    std::ofstream output(output_path);
++    if (!input || !output || !std::isfinite(threshold)) throw std::runtime_error("Invalid delta evaluation input");
++    init_lookup_tables();
++    SolverContext context;
++    std::string family;
++    int root = 0, count = 0;
++    while (input >> family >> root) {
++        dds_research::Key key{};
++        for (auto& word : key) if (!(input >> word)) throw std::runtime_error("Truncated delta root");
++        const auto deal = dds_research::deal_from_key(key);
++        double baseline_time = 0, model_time = 0;
++        std::uint64_t baseline_nodes = 0, model_nodes = 0;
++        int calls = 0, deviations = 0;
++        for (int repeat = 0; repeat < 3; ++repeat) {
++            std::array<int, 52> reference{}, guided{};
++            for (int pass = 0; pass < 2; ++pass) {
++                const bool use_model = (pass + repeat + count) % 2;
++                const bool enabled = use_model && (key[24] + 7) / 4 >= 10;
++                dds_research::Research state;
++                state.learn = false;
++                state.count_only = !enabled;
++                state.min_depth = std::max(0, static_cast<int>(key[24]) - 2);
++                DeltaHook hook{model, key[24], threshold};
++                state.apply = enabled;
++                state.teacher_hook = enabled ? &DeltaHook::choose : nullptr;
++                state.teacher_context = &hook;
++                const double start = cpu_seconds();
++                const auto result = solve(context, deal, &state);
++                const double elapsed = cpu_seconds() - start;
++                if (use_model) {
++                    guided = scores(result); model_time += elapsed; model_nodes += state.nodes;
++                    calls += hook.calls; deviations += hook.deviations;
++                } else {
++                    reference = scores(result); baseline_time += elapsed; baseline_nodes += state.nodes;
++                }
++            }
++            if (reference != guided) throw std::runtime_error("Delta model changed exact scores");
++        }
++        output << "{\"family\":\"" << family << "\",\"root\":" << root
++            << ",\"baseline_seconds\":" << baseline_time << ",\"model_seconds\":" << model_time
++            << ",\"baseline_nodes\":" << baseline_nodes << ",\"model_nodes\":" << model_nodes
++            << ",\"model_calls\":" << calls << ",\"deviations\":" << deviations
++            << ",\"all_moves_equal\":true}\n";
++        output.flush();
++        ++count;
++    }
++}
++
 +} // namespace
 +
 +auto main(int argc, char** argv) -> int
 +{
 +    try {
++        if (argc == 5 && std::string(argv[1]) == "delta-infer") {
++            delta_infer(argv[2], argv[3], argv[4]); return 0;
++        }
++        if (argc == 6 && std::string(argv[1]) == "delta") {
++            evaluate_delta(argv[2], argv[3], argv[4], std::stof(argv[5])); return 0;
++        }
++        if (argc >= 4 && std::string(argv[1]) == "intervene") {
++            intervene(argv[2], argv[3], argc > 4 ? std::stoi(argv[4]) : 3,
++                argc > 5 ? std::stoi(argv[5]) : 4, argc > 6 && std::string(argv[6]) == "cost"); return 0;
++        }
 +        if (argc == 4 && std::string(argv[1]) == "oracle") {
 +            oracle(argv[2], argv[3]); return 0;
 +        }
@@ -667,10 +884,10 @@ index a487262..feafdf4 100644
  void make_0(
 diff --git a/library/src/proof_model.hpp b/library/src/proof_model.hpp
 new file mode 100644
-index 0000000..20164e6
+index 0000000..5549ff6
 --- /dev/null
 +++ b/library/src/proof_model.hpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,175 @@
 +#pragma once
 +
 +#include <research_order.hpp>
@@ -773,13 +990,85 @@ index 0000000..20164e6
 +    std::array<float, Outputs> output_bias_{};
 +};
 +
++// Predict the change in log whole-root nodes from one promotion of stock
++// choice 2, 3, or 4. Zero means retain DDS's existing first choice.
++constexpr int DeltaInputs = 480;
++
++inline auto delta_features(const dds_research::Key& key, const MovePlyType& moves, int ply)
++    -> std::array<float, DeltaInputs>
++{
++    std::array<float, DeltaInputs> x{};
++    const auto base = features(key, moves);
++    std::copy(base.begin(), base.end(), x.begin());
++    for (int i = 0; i <= moves.last; ++i)
++        x[427 + moves.move[i].suit * 13 + moves.move[i].rank - 2] = 1.0f / (i + 1);
++    x[479] = ply / 12.0f;
++    return x;
++}
++
++class DeltaModel
++{
++public:
++    explicit DeltaModel(const std::string& path)
++    {
++        std::ifstream in(path);
++        std::string magic;
++        int inputs = 0, hidden = 0, outputs = 0;
++        in >> magic >> inputs >> hidden >> outputs;
++        if (!in || magic != "DDS_DELTA_V1" || inputs != DeltaInputs || hidden != Hidden || outputs != 3)
++            throw std::runtime_error("Invalid delta model header");
++        read(in, weights_); read(in, bias_); read(in, output_weights_); read(in, output_bias_);
++        std::string trailing;
++        if (in >> trailing) throw std::runtime_error("Trailing delta model data");
++    }
++
++    auto evaluate(const std::array<float, DeltaInputs>& x) const -> std::array<float, 3>
++    {
++        auto h = bias_;
++        for (int i = 0; i < DeltaInputs; ++i) {
++            if (x[i] == 0) continue;
++            for (int j = 0; j < Hidden; ++j) h[j] += x[i] * weights_[i * Hidden + j];
++        }
++        auto y = output_bias_;
++        for (int j = 0; j < Hidden; ++j) {
++            if (h[j] <= 0) continue;
++            for (int c = 0; c < 3; ++c) y[c] += h[j] * output_weights_[j * 3 + c];
++        }
++        return y;
++    }
++
++    auto choose(const dds_research::Key& key, const MovePlyType& moves, int ply, float threshold) const
++        -> dds_research::Hint
++    {
++        const auto y = evaluate(delta_features(key, moves, ply));
++        int best = -1;
++        for (int i = 0; i < std::min(3, moves.last); ++i)
++            if (y[i] < threshold) { threshold = y[i]; best = i + 1; }
++        if (best < 0) return {-1, 0, 0};
++        return {moves.move[best].suit, moves.move[best].rank, 0};
++    }
++
++private:
++    template<std::size_t N>
++    static auto read(std::ifstream& in, std::array<float, N>& values) -> void
++    {
++        for (auto& value : values)
++            if (!(in >> value) || !std::isfinite(value))
++                throw std::runtime_error("Invalid delta model weights");
++    }
++    std::array<float, DeltaInputs * Hidden> weights_{};
++    std::array<float, Hidden> bias_{};
++    std::array<float, Hidden * 3> output_weights_{};
++    std::array<float, 3> output_bias_{};
++};
++
 +} // namespace dds_proof
 diff --git a/library/src/research_order.hpp b/library/src/research_order.hpp
 new file mode 100644
-index 0000000..53d887b
+index 0000000..b6cf606
 --- /dev/null
 +++ b/library/src/research_order.hpp
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,328 @@
 +#pragma once
 +
 +// Experimental instrumentation, not part of the public DDS API.
@@ -903,6 +1192,7 @@ index 0000000..53d887b
 +    std::vector<Hint> moves;
 +    std::uint64_t cost = 0;
 +    std::vector<ChildObservation> observed;
++    std::uint64_t visit_index = 0;
 +};
 +
 +struct SearchLimitExceeded : std::runtime_error
@@ -1014,6 +1304,7 @@ index 0000000..53d887b
 +        if (depth < active->min_depth || (active->leads_only && rel != 0)) return;
 +        state_ = active;
 +        ++state_->lookups;
++        decision_index_ = state_->lookups;
 +        ++state_->lookups_by_depth[depth];
 +        if (state_->replay_trace) {
 +            if (state_->trace_index >= state_->trace.size())
@@ -1064,7 +1355,7 @@ index 0000000..53d887b
 +        }
 +        if (state_ && !choices_.empty() &&
 +            state_->nodes-subtree_start_ >= state_->decision_min_nodes)
-+            state_->decisions.push_back({key_, std::move(choices_), state_->nodes-subtree_start_, std::move(observed_)});
++            state_->decisions.push_back({key_, std::move(choices_), state_->nodes-subtree_start_, std::move(observed_), decision_index_});
 +    }
 +
 +    auto start_child() -> void
@@ -1100,6 +1391,7 @@ index 0000000..53d887b
 +    std::uint64_t child_start_ = 0;
 +    int children_ = 0;
 +    std::uint64_t subtree_start_ = 0;
++    std::uint64_t decision_index_ = 0;
 +    std::vector<Hint> choices_;
 +    std::vector<ChildObservation> observed_;
 +};

@@ -209,3 +209,7 @@ contributors. This experiment relies on their exact solver and retains its
 Apache-2.0 notices. Max Schireson proposed scavenging self-play for proof
 learning and directed the work. OpenAI ChatGPT/Codex assisted with the prototype,
 measurements, tests, and report. See the repository's CREDITS.md and LICENSE.
+
+## Counterfactual ordering follow-up
+
+[Counterfactual study](counterfactual_study.md): promote stock choices 2–4 at a single early encounter and measure the full solve. A 100-root teacher finds 5.38% hindsight node savings within three card plays; the first residual model does not generalize (reserved family +2.21% nodes, +7.42% CPU). Stock DDS remains the default.

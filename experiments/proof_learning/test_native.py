@@ -13,6 +13,27 @@ from pipeline import features, forward
 @unittest.skipUnless(os.environ.get('DDS_PROOF_BINARY'), 'native fixture not supplied')
 class NativeTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
+    def test_counterfactual_changes_one_early_choice_and_checks_full_root(self):
+        lines = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
+        chosen = next(r for r in lines if (int(r.split()[26]) + 7) // 4 >= 10)
+        with tempfile.TemporaryDirectory() as directory:
+            source, result = Path(directory) / 'roots', Path(directory) / 'interventions'
+            source.write_text(chosen + '\n')
+            subprocess.run([os.environ['DDS_PROOF_BINARY'], 'intervene', str(source), str(result)], check=True)
+            rows = [json.loads(x) for x in result.read_text().splitlines()]
+            self.assertTrue(rows)
+            for r in rows:
+                self.assertLess(r['ply_from_root'], 3)
+                self.assertLessEqual(r['decision_index'], 4)
+                self.assertEqual(r['trials'][0]['rank'], 1)
+                self.assertEqual(r['trials'][0]['nodes'], r['baseline_nodes'])
+                for trial in r['trials']:
+                    self.assertEqual(trial['interventions'], 1)
+                    self.assertIn(trial['rank'], [1, 2, 3, 4])
+                    if trial['complete']:
+                        self.assertTrue(trial['all_moves_equal'])
+
+    @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
     def test_hindsight_oracle_still_verifies_every_move(self):
         lines = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
         chosen = next(r for r in lines if (int(r.split()[26]) + 7) // 4 >= 10)
