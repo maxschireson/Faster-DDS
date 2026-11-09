@@ -1,0 +1,966 @@
+diff --git a/benchmarks/BUILD.bazel b/benchmarks/BUILD.bazel
+index 1543f67..2b9709b 100644
+--- a/benchmarks/BUILD.bazel
++++ b/benchmarks/BUILD.bazel
+@@ -90,3 +90,10 @@ cc_test(
+         "@googletest//:gtest_main",
+     ],
+ )
++
++cc_binary(
++    name = "proof_learning",
++    srcs = ["proof_learning.cpp"],
++    copts = DDS_CPPOPTS,
++    deps = ["//library/src:dds"],
++)
+diff --git a/benchmarks/proof_learning.cpp b/benchmarks/proof_learning.cpp
+new file mode 100644
+index 0000000..a6325ee
+--- /dev/null
++++ b/benchmarks/proof_learning.cpp
+@@ -0,0 +1,217 @@
++// Offline self-play scavenger. Every output remains an exact DDS result.
++#include <proof_model.hpp>
++#include <research_teacher.hpp>
++#include <api/solve_board.hpp>
++#include <lookup_tables/lookup_tables.hpp>
++#include <algorithm>
++#include <array>
++#include <ctime>
++#include <fstream>
++#include <iostream>
++#include <iomanip>
++#include <memory>
++#include <set>
++#include <string>
++
++namespace {
++
++auto cpu_seconds() -> double { return static_cast<double>(std::clock()) / CLOCKS_PER_SEC; }
++
++auto scores(const FutureTricks& result) -> std::array<int, 52>
++{
++    std::array<int, 52> output{};
++    output.fill(-1);
++    for (int i = 0; i < result.cards; ++i)
++        for (int rank = 2; rank <= 14; ++rank)
++            if ((result.equals[i] | (1 << result.rank[i])) & (1 << rank))
++                output[result.suit[i] * 13 + rank - 2] = result.score[i];
++    return output;
++}
++
++auto solve(SolverContext& context, const Deal& deal, dds_research::Research* research) -> FutureTricks
++{
++    context.reset_for_solve();
++    dds_research::ActiveGuard guard(research);
++    FutureTricks result{};
++    const int code = solve_board(context, deal, -1, 3, 1, &result);
++    if (code != RETURN_NO_FAULT) throw std::runtime_error("DDS solve error " + std::to_string(code));
++    return result;
++}
++
++auto label(std::ostream& out, const std::string& family, int root,
++           const dds_research::Decision& decision, SolverContext& shadow) -> void
++{
++    const auto& key = decision.key;
++    const auto parent = dds_research::deal_from_key(key);
++    const int actor = (key[17] + key[18]) % 4;
++    const int tricks = (key[24] + 7) / 4;
++    const bool is_max = (actor % 2 == 0) == (key[20] != 0);
++    const int residual = static_cast<std::int16_t>(key[16]);
++    const int need = is_max ? residual : tricks - residual + 1;
++    out << "{\"family\":\"" << family << "\",\"root\":" << root << ",\"key\":[";
++    for (std::size_t i = 0; i < key.size(); ++i) out << (i ? "," : "") << key[i];
++    out << "],\"parent_nodes\":" << decision.cost << ",\"moves\":[";
++    bool first = true;
++    for (const auto& move : decision.moves) {
++        const auto q = dds_research::child_query(parent, key[18], tricks, need, move.suit, move.rank);
++        std::uint64_t cost = 0;
++        bool succeeds = false;
++        if (q.trivial != -1) succeeds = static_cast<bool>(q.trivial) == q.want_success;
++        else {
++            shadow.reset_for_solve();
++            dds_research::Research probe;
++            probe.count_only = true;
++            dds_research::ActiveGuard guard(&probe);
++            FutureTricks result{};
++            const int code = solve_board(shadow, q.deal, q.target, 1, 1, &result);
++            if (code != RETURN_NO_FAULT) throw std::runtime_error("Teacher solve error");
++            succeeds = (result.score[0] >= q.target) == q.want_success;
++            cost = probe.nodes;
++        }
++        out << (first ? "" : ",") << '[' << move.suit * 13 + move.rank - 2
++            << ',' << succeeds << ',' << cost << ']';
++        first = false;
++    }
++    out << "]}\n";
++}
++
++struct ModelHook
++{
++    const dds_proof::Model& model;
++    int calls = 0;
++    int cap = 8;
++    static auto choose(const dds_research::Key& key, const MovePlyType& moves, void* context)
++        -> dds_research::Hint
++    {
++        auto& self = *static_cast<ModelHook*>(context);
++        if (self.calls >= self.cap) return {-1, 0, 0};
++        ++self.calls;
++        return self.model.choose(key, moves);
++    }
++};
++
++auto infer(const std::string& model_path, const std::string& input_path, const std::string& output_path) -> void
++{
++    dds_proof::Model model(model_path);
++    std::ifstream input(input_path);
++    std::ofstream output(output_path);
++    if (!input || !output) throw std::runtime_error("Cannot open inference fixture");
++    std::vector<std::pair<dds_research::Key, MovePlyType>> cases;
++    dds_research::Key key{};
++    while (input >> key[0]) {
++        for (std::size_t i = 1; i < key.size(); ++i)
++            if (!(input >> key[i])) throw std::runtime_error("Truncated inference key");
++        MovePlyType moves{};
++        int count = 0;
++        if (!(input >> count) || count < 1 || count > 13) throw std::runtime_error("Invalid move count");
++        moves.last = count - 1;
++        for (int i = 0; i < count; ++i) {
++            int card = 0;
++            if (!(input >> card) || card < 0 || card >= 52) throw std::runtime_error("Invalid card");
++            moves.move[i].suit = card / 13; moves.move[i].rank = card % 13 + 2;
++        }
++        cases.emplace_back(key, moves);
++        const auto y = model.evaluate(dds_proof::features(key, moves));
++        output << '[' << std::setprecision(9);
++        for (std::size_t i = 0; i < y.size(); ++i) output << (i ? "," : "") << y[i];
++        output << "]\n";
++    }
++    if (cases.empty()) throw std::runtime_error("No inference cases");
++    int checksum = 0;
++    const double start = cpu_seconds();
++    for (int repeat = 0; repeat < 100; ++repeat)
++        for (const auto& [position, moves] : cases)
++            checksum += model.choose(position, moves).rank;
++    output << "{\"microseconds_per_choice\":" << (cpu_seconds() - start) * 1e6 / (100 * cases.size())
++        << ",\"choices\":" << 100 * cases.size() << ",\"checksum\":" << checksum << "}\n";
++}
++
++} // namespace
++
++auto main(int argc, char** argv) -> int
++{
++    try {
++        if (argc == 5 && std::string(argv[1]) == "infer") {
++            infer(argv[2], argv[3], argv[4]); return 0;
++        }
++        if (argc < 4) throw std::runtime_error("Usage: proof_learning collect|evaluate ROOTS OUTPUT [MODEL] [CAP]");
++        const bool collect = std::string(argv[1]) == "collect";
++        if (!collect && (std::string(argv[1]) != "evaluate" || argc < 5))
++            throw std::runtime_error("Invalid command");
++        std::ifstream input(argv[2]);
++        std::ofstream output(argv[3]);
++        if (!input || !output) throw std::runtime_error("Cannot open input/output");
++        init_lookup_tables();
++        SolverContext baseline_context, shadow;
++        std::unique_ptr<dds_proof::Model> model;
++        if (!collect) model = std::make_unique<dds_proof::Model>(argv[4]);
++        std::set<dds_research::Key> seen;
++        std::string family;
++        int root = 0, count = 0;
++        while (input >> family >> root) {
++            dds_research::Key key{};
++            for (auto& word : key) if (!(input >> word)) throw std::runtime_error("Truncated root");
++            if (key[17] > 3 || key[18] > 3 || key[19] > 4 || key[24] > 48)
++                throw std::runtime_error("Invalid root metadata");
++            const auto deal = dds_research::deal_from_key(key);
++            if (collect) {
++                dds_research::Research research;
++                research.learn = false;
++                research.collect_decisions = true;
++                research.min_depth = std::max(0, static_cast<int>(key[24]) - 4);
++                research.decision_min_nodes = 64;
++                const auto reference = solve(baseline_context, deal, nullptr);
++                const auto instrumented = solve(baseline_context, deal, &research);
++                if (scores(reference) != scores(instrumented)) throw std::runtime_error("Collector changed scores");
++                std::stable_sort(research.decisions.begin(), research.decisions.end(),
++                    [](const auto& a, const auto& b) { return a.cost > b.cost; });
++                int emitted = 0;
++                for (const auto& decision : research.decisions) {
++                    // Deduplicate exact states before partitioning by family.
++                    if (!seen.insert(decision.key).second) continue;
++                    label(output, family, root, decision, shadow);
++                    if (++emitted == 8) break;
++                }
++            } else {
++                double baseline_time = 0, model_time = 0;
++                std::uint64_t baseline_nodes = 0, model_nodes = 0;
++                int calls = 0;
++                // Alternate order; repeat to reduce noise on small calls.
++                for (int repeat = 0; repeat < 3; ++repeat) {
++                    std::array<int, 52> reference{}, guided{};
++                    for (int pass = 0; pass < 2; ++pass) {
++                        const bool use_model = (pass + repeat + count) % 2;
++                        dds_research::Research state;
++                        state.learn = false;
++                        state.count_only = !use_model;
++                        ModelHook hook{*model};
++                        if (argc > 5) hook.cap = std::stoi(argv[5]);
++                        state.min_depth = std::max(0, static_cast<int>(key[24]) - 4);
++                        state.apply = use_model;
++                        state.teacher_hook = use_model ? &ModelHook::choose : nullptr;
++                        state.teacher_context = &hook;
++                        const double start = cpu_seconds();
++                        const auto result = solve(baseline_context, deal, &state);
++                        const double elapsed = cpu_seconds() - start;
++                        if (use_model) {
++                            guided = scores(result); model_time += elapsed; model_nodes += state.nodes; calls += hook.calls;
++                        } else { reference = scores(result); baseline_time += elapsed; baseline_nodes += state.nodes; }
++                    }
++                    if (reference != guided) throw std::runtime_error("Model changed exact all-move scores");
++                }
++                output << "{\"family\":\"" << family << "\",\"root\":" << root
++                    << ",\"baseline_seconds\":" << baseline_time << ",\"model_seconds\":" << model_time
++                    << ",\"baseline_nodes\":" << baseline_nodes << ",\"model_nodes\":" << model_nodes
++                    << ",\"model_calls\":" << calls << ",\"all_moves_equal\":true}\n";
++            }
++            output.flush();
++            if (++count % 25 == 0) std::cerr << "processed " << count << " roots\n";
++        }
++        if (!input.eof()) throw std::runtime_error("Invalid input record");
++        if (!output) throw std::runtime_error("Output write failed");
++        std::cerr << "completed " << count << " roots\n";
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n'; return 1;
++    }
++    return 0;
++}
+diff --git a/library/src/ab_search.cpp b/library/src/ab_search.cpp
+index a487262..3b37b8a 100644
+--- a/library/src/ab_search.cpp
++++ b/library/src/ab_search.cpp
+@@ -10,6 +10,7 @@
+ #include <cassert>
+ 
+ #include "ab_search.hpp"
++#include "research_order.hpp"
+ #include <ab_stats.hpp>
+ #include <cstddef>
+ #include <dump.hpp>
+@@ -204,6 +205,7 @@ bool ab_search(
+     int tricks = depth >> 2;
+     bool success = (ctx.search().node_type_store(hand) == MAXNODE ? true : false);
+     bool value = ! success;
++    dds_research::visit(depth);
+ #ifdef DDS_TOP_LEVEL
+     ctx.search().nodes()++;
+ #endif
+@@ -225,6 +227,8 @@ bool ab_search(
+     for (int ss = 0; ss < DDS_SUITS; ss++)
+         posPoint->win_ranks[depth][ss] = 0;
+ 
++    dds_research::Frame research_frame(*posPoint, target, depth, 0, ctx);
++
+     while (1)
+     {
+         TIMER_START(TIMER_NO_MAKE, depth);
+@@ -238,6 +242,8 @@ bool ab_search(
+         if (mply == NULL)
+             break;
+ 
++        research_frame.start_child();
++
+         make_0(posPoint, depth, mply);
+ 
+         TIMER_START(TIMER_NO_AB, depth - 1);
+@@ -248,6 +254,8 @@ bool ab_search(
+         undo_1(posPoint, depth, * mply);
+         TIMER_END(TIMER_NO_UNDO, depth);
+ 
++        research_frame.child_done(*mply, value == success);
++
+         if (value == success) /* A cut-off? */
+         {
+             for (int ss = 0; ss < DDS_SUITS; ss++)
+@@ -306,6 +314,7 @@ static bool ab_search_0_ctx(
+     int hand = posPoint->first[depth];
+     int tricks = depth >> 2;
+ 
++    dds_research::visit(depth);
+ #ifdef DDS_TOP_LEVEL
+     ctx.search().nodes()++;
+ #endif
+@@ -414,6 +423,8 @@ static bool ab_search_0_ctx(
+     for (int ss = 0; ss < DDS_SUITS; ss++)
+         posPoint->win_ranks[depth][ss] = 0;
+ 
++    dds_research::Frame research_frame(*posPoint, target, depth, 0, ctx);
++
+     while (1)
+     {
+         TIMER_START(TIMER_NO_MAKE, depth);
+@@ -427,6 +438,8 @@ static bool ab_search_0_ctx(
+         if (mply == NULL)
+             break;
+ 
++        research_frame.start_child();
++
+         make_0(posPoint, depth, mply);
+ 
+         TIMER_START(TIMER_NO_AB, depth - 1);
+@@ -437,6 +450,8 @@ static bool ab_search_0_ctx(
+         undo_1(posPoint, depth, * mply);
+         TIMER_END(TIMER_NO_UNDO, depth);
+ 
++        research_frame.child_done(*mply, value == success);
++
+         if (value == success) /* A cut-off? */
+         {
+             for (int ss = 0; ss < DDS_SUITS; ss++)
+@@ -488,6 +503,7 @@ static bool ab_search_1_ctx(
+     bool value = ! success;
+     int tricks = (depth + 3) >> 2;
+ 
++    dds_research::visit(depth);
+ #ifdef DDS_TOP_LEVEL
+     ctx.search().nodes()++;
+ #endif
+@@ -514,6 +530,8 @@ static bool ab_search_1_ctx(
+     for (int ss = 0; ss < DDS_SUITS; ss++)
+         posPoint->win_ranks[depth][ss] = 0;
+ 
++    dds_research::Frame research_frame(*posPoint, target, depth, 1, ctx);
++
+     while (1)
+     {
+         TIMER_START(TIMER_NO_MAKE, depth);
+@@ -526,6 +544,8 @@ static bool ab_search_1_ctx(
+         if (mply == NULL)
+             break;
+ 
++        research_frame.start_child();
++
+         make_1(posPoint, depth, mply);
+ 
+         TIMER_START(TIMER_NO_AB, depth - 1);
+@@ -536,6 +556,8 @@ static bool ab_search_1_ctx(
+         undo_2(posPoint, depth, * mply);
+         TIMER_END(TIMER_NO_UNDO, depth);
+ 
++        research_frame.child_done(*mply, value == success);
++
+         if (value == success) /* A cut-off? */
+         {
+             for (int ss = 0; ss < DDS_SUITS; ss++)
+@@ -585,6 +607,7 @@ static bool ab_search_2_ctx(
+     bool value = ! success;
+     int tricks = (depth + 3) >> 2;
+ 
++    dds_research::visit(depth);
+ #ifdef DDS_TOP_LEVEL
+     ctx.search().nodes()++;
+ #endif
+@@ -602,6 +625,8 @@ static bool ab_search_2_ctx(
+     for (int ss = 0; ss < DDS_SUITS; ss++)
+         posPoint->win_ranks[depth][ss] = 0;
+ 
++    dds_research::Frame research_frame(*posPoint, target, depth, 2, ctx);
++
+     while (1)
+     {
+         TIMER_START(TIMER_NO_MAKE, depth);
+@@ -610,6 +635,8 @@ static bool ab_search_2_ctx(
+         if (mply == NULL)
+             break;
+ 
++        research_frame.start_child();
++
+         make_2(posPoint, depth, mply);
+ 
+ #ifdef DDS_AB_STATS
+@@ -625,6 +652,8 @@ static bool ab_search_2_ctx(
+         undo_3(posPoint, depth, * mply);
+         TIMER_END(TIMER_NO_UNDO, depth);
+ 
++        research_frame.child_done(*mply, value == success);
++
+         if (value == success) /* A cut-off? */
+         {
+             for (int ss = 0; ss < DDS_SUITS; ss++)
+@@ -677,6 +706,7 @@ static bool ab_search_3_ctx(
+     bool success = (ctx.search().node_type_store(hand) == MAXNODE ? true : false);
+     bool value = ! success;
+ 
++    dds_research::visit(depth);
+ #ifdef DDS_TOP_LEVEL
+     ctx.search().nodes()++;
+ #endif
+@@ -695,6 +725,8 @@ static bool ab_search_3_ctx(
+     for (int ss = 0; ss < DDS_SUITS; ss++)
+         posPoint->win_ranks[depth][ss] = 0;
+ 
++    dds_research::Frame research_frame(*posPoint, target, depth, 3, ctx);
++
+     while (1)
+     {
+         TIMER_START(TIMER_NO_MAKE, depth);
+@@ -707,6 +739,8 @@ static bool ab_search_3_ctx(
+         if (mply == NULL)
+             break;
+ 
++        research_frame.start_child();
++
+     make_3(posPoint, makeWinRank, depth, mply, ctx);
+ 
+         ctx.search().trick_nodes()++; // As hand_rel_first == 0
+@@ -726,6 +760,8 @@ static bool ab_search_3_ctx(
+ 
+         TIMER_END(TIMER_NO_UNDO, depth);
+ 
++        research_frame.child_done(*mply, value == success);
++
+         if (value == success) /* A cut-off? */
+         {
+             for (int ss = 0; ss < DDS_SUITS; ss++)
+diff --git a/library/src/proof_model.hpp b/library/src/proof_model.hpp
+new file mode 100644
+index 0000000..20164e6
+--- /dev/null
++++ b/library/src/proof_model.hpp
+@@ -0,0 +1,103 @@
++#pragma once
++
++#include <research_order.hpp>
++#include <array>
++#include <cmath>
++#include <fstream>
++#include <string>
++
++namespace dds_proof {
++
++constexpr int Inputs = 427;
++constexpr int Hidden = 64;
++constexpr int Outputs = 104;
++
++inline auto features(const dds_research::Key& key, const MovePlyType& moves)
++    -> std::array<float, Inputs>
++{
++    std::array<float, Inputs> x{};
++    const int actor = (key[17] + key[18]) % 4;
++    for (int relative = 0; relative < 4; ++relative)
++        for (int suit = 0; suit < 4; ++suit)
++            for (int rank = 0; rank < 13; ++rank)
++                x[relative * 52 + suit * 13 + rank] =
++                    (key[4 * ((actor + relative) % 4) + suit] >> rank) & 1;
++    for (int i = 0; i < key[18]; ++i) {
++        const int card = key[21 + i];
++        x[208 + i * 52 + (card / 16) * 13 + card % 16 - 2] = 1;
++    }
++    x[364 + key[19]] = 1;
++    x[369 + key[18]] = 1;
++    const int remaining = (key[24] + 7) / 4;
++    const int residual = static_cast<std::int16_t>(key[16]);
++    const bool is_max = (actor % 2 == 0) == (key[20] != 0);
++    const int need = is_max ? residual : remaining - residual + 1;
++    x[373] = need / 13.0f;
++    x[374] = remaining / 13.0f;
++    for (int i = 0; i <= moves.last; ++i)
++        x[375 + moves.move[i].suit * 13 + moves.move[i].rank - 2] = 1;
++    return x;
++}
++
++class Model
++{
++public:
++    explicit Model(const std::string& path)
++    {
++        std::ifstream in(path);
++        std::string magic;
++        int inputs = 0, hidden = 0, outputs = 0;
++        in >> magic >> inputs >> hidden >> outputs;
++        if (!in || magic != "DDS_PROOF_V1" || inputs != Inputs ||
++            hidden != Hidden || outputs != Outputs)
++            throw std::runtime_error("Invalid proof model header");
++        read(in, weights_); read(in, bias_); read(in, output_weights_); read(in, output_bias_);
++        std::string trailing;
++        if (in >> trailing) throw std::runtime_error("Trailing proof model data");
++    }
++
++    auto evaluate(const std::array<float, Inputs>& x) const -> std::array<float, Outputs>
++    {
++        auto h = bias_;
++        for (int i = 0; i < Inputs; ++i) {
++            if (x[i] == 0) continue;
++            for (int j = 0; j < Hidden; ++j) h[j] += x[i] * weights_[i * Hidden + j];
++        }
++        auto y = output_bias_;
++        for (int j = 0; j < Hidden; ++j) {
++            if (h[j] <= 0) continue;
++            for (int c = 0; c < Outputs; ++c) y[c] += h[j] * output_weights_[j * Outputs + c];
++        }
++        return y;
++    }
++
++    auto choose(const dds_research::Key& key, const MovePlyType& moves) const -> dds_research::Hint
++    {
++        const auto y = evaluate(features(key, moves));
++        float best = -1;
++        dds_research::Hint hint{-1, 0, 0};
++        for (int i = 0; i <= moves.last; ++i) {
++            const auto& move = moves.move[i];
++            const int card = move.suit * 13 + move.rank - 2;
++            const float probability = 1 / (1 + std::exp(-std::clamp(y[card], -30.0f, 30.0f)));
++            const float value = probability * std::exp(-std::clamp(y[52 + card], 0.0f, 30.0f));
++            if (value > best) { best = value; hint = {move.suit, move.rank, 0}; }
++        }
++        return hint;
++    }
++
++private:
++    template<std::size_t N>
++    static auto read(std::ifstream& in, std::array<float, N>& values) -> void
++    {
++        for (auto& value : values)
++            if (!(in >> value) || !std::isfinite(value))
++                throw std::runtime_error("Invalid proof model weights");
++    }
++    std::array<float, Inputs * Hidden> weights_{};
++    std::array<float, Hidden> bias_{};
++    std::array<float, Hidden * Outputs> output_weights_{};
++    std::array<float, Outputs> output_bias_{};
++};
++
++} // namespace dds_proof
+diff --git a/library/src/research_order.hpp b/library/src/research_order.hpp
+new file mode 100644
+index 0000000..470ca4e
+--- /dev/null
++++ b/library/src/research_order.hpp
+@@ -0,0 +1,238 @@
++#pragma once
++
++// Experimental instrumentation, not part of the public DDS API.
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <unordered_map>
++#include <stdexcept>
++#include <vector>
++#include <solver_context/solver_context.hpp>
++
++namespace dds_research {
++
++using Key = std::array<std::uint16_t, 26>;
++
++struct KeyHash
++{
++    auto operator()(const Key& key) const -> std::size_t
++    {
++        std::uint64_t h = 14695981039346656037ULL;
++        for (const auto word : key) {
++            h ^= word;
++            h *= 1099511628211ULL;
++        }
++        return h;
++    }
++};
++
++inline auto make_key(const Pos& pos, int target, int depth, int rel,
++                     int trump, bool max_is_even, const Moves& moves) -> Key
++{
++    Key key{};
++    for (int h = 0; h < 4; ++h)
++        for (int s = 0; s < 4; ++s)
++            key[4*h+s] = pos.rank_in_suit[h][s];
++    key[16] = static_cast<std::uint16_t>(target-pos.tricks_max);
++    key[17] = static_cast<std::uint16_t>(pos.first[depth]);
++    key[18] = static_cast<std::uint16_t>(rel);
++    key[19] = static_cast<std::uint16_t>(trump);
++    key[20] = max_is_even;
++    const auto& track = moves.track[(depth+3)/4];
++    for (int i = 0; i < rel; ++i)
++        key[21+i] = static_cast<std::uint16_t>(16*track.play_suits[i]+track.play_ranks[i]);
++    key[24] = static_cast<std::uint16_t>(depth);
++    return key;
++}
++
++inline auto promote(MovePlyType& list, int suit, int rank) -> bool
++{
++    for (int i = 0; i <= list.last; ++i) {
++        if (list.move[i].suit != suit || list.move[i].rank != rank) continue;
++        std::rotate(list.move, list.move+i, list.move+i+1);
++        return true;
++    }
++    return false;
++}
++
++// Used only for move-order hints, never for accepting a score or pruning.
++// On a North/South turn, pool E/W cards while preserving both N/S hands.
++inline auto hint_key(Key key, bool share_ns) -> Key
++{
++    if (share_ns && (key[17]+key[18])%2 == 0) {
++        for (int suit = 0; suit < 4; ++suit) {
++            key[4+suit] |= key[12+suit];
++            key[12+suit] = 0;
++        }
++    }
++    return key;
++}
++
++struct Hint { int suit; int rank; std::uint64_t cost; };
++
++struct Decision
++{
++    Key key{};
++    std::vector<Hint> moves;
++    std::uint64_t cost = 0;
++};
++
++struct SearchLimitExceeded : std::runtime_error
++{
++    SearchLimitExceeded() : std::runtime_error("Research search-node budget exceeded") {}
++};
++
++struct Research
++{
++    std::unordered_map<Key, Hint, KeyHash> policy;
++    bool apply = false;
++    bool learn = true;
++    int min_depth = 0;
++    bool leads_only = false;
++    bool capture_trace = false;
++    bool replay_trace = false;
++    bool recover_policy = false;
++    bool share_ns = false;
++    bool count_only = false;
++    bool collect_decisions = false;
++    std::uint64_t decision_min_nodes = 16;
++    std::uint64_t node_limit = 0;
++    std::vector<Decision> decisions;
++    Hint (*teacher_hook)(const Key&, const MovePlyType&, void*) = nullptr;
++    void* teacher_context = nullptr;
++    std::vector<Hint> trace;
++    std::size_t trace_index = 0;
++    std::uint64_t nodes = 0;
++    std::uint64_t branches = 0;
++    std::uint64_t lookups = 0;
++    std::uint64_t hits = 0;
++    std::uint64_t promoted = 0;
++    std::uint64_t cutoffs = 0;
++    std::uint64_t first_cutoffs = 0;
++    std::array<std::uint64_t, 50> nodes_by_depth{};
++    std::array<std::uint64_t, 50> lookups_by_depth{};
++
++    auto reset_counts() -> void
++    {
++        nodes = branches = lookups = hits = promoted = cutoffs = first_cutoffs = 0;
++        nodes_by_depth.fill(0);
++        lookups_by_depth.fill(0);
++        trace_index = 0;
++        decisions.clear();
++    }
++
++    auto remember(const Key& key, int suit, int rank, std::uint64_t cost) -> void
++    {
++        const auto it = policy.find(key);
++        if (it == policy.end() || cost < it->second.cost)
++            policy[key] = Hint{suit, rank, cost};
++    }
++};
++
++inline thread_local Research* active = nullptr;
++
++class ActiveGuard
++{
++public:
++    explicit ActiveGuard(Research* state) : saved_(active) { active = state; }
++    ~ActiveGuard() { active = saved_; }
++private:
++    Research* saved_;
++};
++
++inline auto visit(int depth) -> void
++{
++    if (active) {
++        ++active->nodes;
++        if (active->node_limit && active->nodes > active->node_limit)
++            throw SearchLimitExceeded();
++        ++active->nodes_by_depth[depth];
++    }
++}
++
++class Frame
++{
++public:
++    Frame(const Pos& pos, int target, int depth, int rel, SolverContext& ctx)
++    {
++        if (!active || active->count_only) return;
++        auto& moves = ctx.thread_ptr()->moves;
++        auto& list = moves.moveList[(depth+3)/4][rel];
++        if (list.last < 1) return;
++        ++active->branches;
++        if (depth < active->min_depth || (active->leads_only && rel != 0)) return;
++        state_ = active;
++        ++state_->lookups;
++        ++state_->lookups_by_depth[depth];
++        if (state_->replay_trace) {
++            if (state_->trace_index >= state_->trace.size())
++                throw std::runtime_error("Oracle trace exhausted");
++            const auto& hint = state_->trace[state_->trace_index++];
++            if (state_->recover_policy && hint.suit >= 0) {
++                const auto key = make_key(pos, target, depth, rel, ctx.thread_ptr()->trump,
++                    ctx.search().node_type_store(0) == MAXNODE, moves);
++                state_->policy[hint_key(key, state_->share_ns)] = hint;
++            }
++            if (hint.suit >= 0 && !promote(list, hint.suit, hint.rank))
++                throw std::runtime_error("Oracle trace contains an unavailable move");
++            return;
++        }
++        const auto raw_key = make_key(pos, target, depth, rel, ctx.thread_ptr()->trump,
++                        ctx.search().node_type_store(0) == MAXNODE, moves);
++        key_ = hint_key(raw_key, state_->share_ns);
++        if (state_->collect_decisions) {
++            subtree_start_ = state_->nodes;
++            for (int i = 0; i <= list.last; ++i)
++                choices_.push_back({list.move[i].suit, list.move[i].rank, 0});
++        }
++        Hint trace_hint{-1, 0, 0};
++        if (state_->teacher_hook)
++            state_->policy[key_] = state_->teacher_hook(raw_key, list, state_->teacher_context);
++        if (state_->apply) {
++            const auto it = state_->policy.find(key_);
++            if (it != state_->policy.end()) {
++                const bool changed = list.move[0].suit != it->second.suit ||
++                                     list.move[0].rank != it->second.rank;
++                if (promote(list, it->second.suit, it->second.rank)) {
++                    trace_hint = it->second;
++                    ++state_->hits;
++                    state_->promoted += changed;
++                }
++            }
++        }
++        if (state_->capture_trace) state_->trace.push_back(trace_hint);
++    }
++
++    ~Frame()
++    {
++        if (state_ && !choices_.empty() &&
++            state_->nodes-subtree_start_ >= state_->decision_min_nodes)
++            state_->decisions.push_back({key_, std::move(choices_), state_->nodes-subtree_start_});
++    }
++
++    auto start_child() -> void
++    {
++        if (!state_) return;
++        child_start_ = state_->nodes;
++        ++children_;
++    }
++
++    auto child_done(const MoveType& move, bool success) -> void
++    {
++        if (!state_ || !success) return;
++        ++state_->cutoffs;
++        state_->first_cutoffs += (children_ == 1);
++        if (state_->learn)
++            state_->remember(key_, move.suit, move.rank, state_->nodes-child_start_);
++    }
++
++private:
++    Research* state_ = nullptr;
++    Key key_{};
++    std::uint64_t child_start_ = 0;
++    int children_ = 0;
++    std::uint64_t subtree_start_ = 0;
++    std::vector<Hint> choices_;
++};
++
++} // namespace dds_research
+diff --git a/library/src/research_teacher.hpp b/library/src/research_teacher.hpp
+new file mode 100644
+index 0000000..0ad117a
+--- /dev/null
++++ b/library/src/research_teacher.hpp
+@@ -0,0 +1,139 @@
++#pragma once
++
++#include "research_order.hpp"
++#include <api/solve_board.hpp>
++#include <limits>
++#include <memory>
++
++namespace dds_research {
++
++struct Query
++{
++    Deal deal{};
++    int target = 0;
++    bool want_success = true;
++    int trivial = -1;
++};
++
++inline auto child_query(const Deal& parent, int rel, int tricks, int need,
++                        int suit, int rank) -> Query
++{
++    Query q;
++    q.deal = parent;
++    const int hand = (parent.first+rel)%4;
++    q.deal.remainCards[hand][suit] &= ~(1u << rank);
++    int next = (hand+1)%4;
++    if (rel < 3) {
++        q.deal.currentTrickSuit[rel] = suit;
++        q.deal.currentTrickRank[rel] = rank;
++    } else {
++        int winner = parent.first;
++        int win_suit = parent.currentTrickSuit[0];
++        int win_rank = parent.currentTrickRank[0];
++        for (int i = 1; i < 4; ++i) {
++            const int s = i == 3 ? suit : parent.currentTrickSuit[i];
++            const int r = i == 3 ? rank : parent.currentTrickRank[i];
++            if ((s == win_suit && r > win_rank) ||
++                (s == parent.trump && win_suit != parent.trump)) {
++                win_suit = s;
++                win_rank = r;
++                winner = (parent.first+i)%4;
++            }
++        }
++        q.deal.first = winner;
++        next = winner;
++        --tricks;
++        if (winner%2 == hand%2) --need;
++        for (int i = 0; i < 3; ++i) {
++            q.deal.currentTrickSuit[i] = 0;
++            q.deal.currentTrickRank[i] = 0;
++        }
++    }
++    q.want_success = next%2 == hand%2;
++    q.target = q.want_success ? need : tricks-need+1;
++    if (q.target <= 0) q.trivial = 1;
++    if (q.target > tricks) q.trivial = 0;
++    return q;
++}
++
++inline auto deal_from_key(const Key& key) -> Deal
++{
++    Deal deal{};
++    deal.first = key[17];
++    deal.trump = key[19];
++    for (int h = 0; h < 4; ++h)
++        for (int s = 0; s < 4; ++s)
++            deal.remainCards[h][s] = static_cast<unsigned>(key[4*h+s]) << 2;
++    for (int i = 0; i < key[18]; ++i) {
++        deal.currentTrickSuit[i] = key[21+i]/16;
++        deal.currentTrickRank[i] = key[21+i]%16;
++    }
++    return deal;
++}
++
++class Teacher
++{
++public:
++    std::unordered_map<Key, Hint, KeyHash> cache;
++    std::uint64_t calls = 0;
++    std::uint64_t nodes = 0;
++    bool reuse_context = false;
++    std::unique_ptr<SolverContext> reusable;
++
++    static auto callback(const Key& key, const MovePlyType& list, void* context) -> Hint
++    {
++        return static_cast<Teacher*>(context)->choose(key, list);
++    }
++
++    auto choose(const Key& key, const MovePlyType& list) -> Hint
++    {
++        if (const auto it = cache.find(key); it != cache.end()) return it->second;
++        const Deal parent = deal_from_key(key);
++        const int rel = key[18];
++        const int hand = (parent.first+rel)%4;
++        const int tricks = (key[24]+7)/4;
++        const bool is_max = (hand%2 == 0) == (key[20] != 0);
++        const int residual = static_cast<std::int16_t>(key[16]);
++        const int need = is_max ? residual : tricks-residual+1;
++        Hint best{-1, 0, std::numeric_limits<std::uint64_t>::max()};
++        for (int i = 0; i <= list.last; ++i) {
++            const auto& move = list.move[i];
++            const auto q = child_query(parent, rel, tricks, need, move.suit, move.rank);
++            bool succeeds;
++            std::uint64_t cost = 0;
++            if (q.trivial != -1) {
++                succeeds = static_cast<bool>(q.trivial) == q.want_success;
++            } else {
++                Research probe;
++                probe.count_only = true;
++                std::unique_ptr<SolverContext> fresh;
++                SolverContext* shadow;
++                if (reuse_context) {
++                    if (!reusable) reusable = std::make_unique<SolverContext>();
++                    reusable->reset_for_solve();
++                    shadow = reusable.get();
++                } else {
++                    fresh = std::make_unique<SolverContext>();
++                    shadow = fresh.get();
++                }
++                FutureTricks result{};
++                auto* saved = active;
++                active = &probe;
++                const int rc = solve_board(*shadow, q.deal, q.target, 1, 1, &result);
++                active = saved;
++                if (rc != RETURN_NO_FAULT)
++                    throw std::runtime_error("Teacher DDS error " + std::to_string(rc));
++                ++calls;
++                nodes += probe.nodes;
++                cost = probe.nodes;
++                succeeds = (result.score[0] >= q.target) == q.want_success;
++            }
++            if (succeeds && cost < best.cost) best = {move.suit, move.rank, cost};
++            if (best.cost == 0) break;
++        }
++        cache[key] = best;
++        return best;
++    }
++};
++
++} // namespace dds_research
+diff --git a/library/tests/ab_search/BUILD.bazel b/library/tests/ab_search/BUILD.bazel
+index 48433aa..d08103a 100644
+--- a/library/tests/ab_search/BUILD.bazel
++++ b/library/tests/ab_search/BUILD.bazel
+@@ -55,3 +55,10 @@ cc_test(
+     ],
+     copts = DDS_CPPOPTS,
+ )
++
++cc_test(
++    name = "proof_model_test",
++    srcs = ["proof_model_test.cpp"],
++    copts = DDS_CPPOPTS,
++    deps = ["//library/src:testable_dds", "@googletest//:gtest_main"],
++)
+diff --git a/library/tests/ab_search/proof_model_test.cpp b/library/tests/ab_search/proof_model_test.cpp
+new file mode 100644
+index 0000000..30faa0a
+--- /dev/null
++++ b/library/tests/ab_search/proof_model_test.cpp
+@@ -0,0 +1,22 @@
++#include <proof_model.hpp>
++#include <gtest/gtest.h>
++
++TEST(ProofModel, RotatesHoldingsAndConditionsOnCurrentSideTarget)
++{
++    dds_research::Key key{};
++    key[4] = 1 << 12;
++    key[16] = 7; key[17] = 0; key[18] = 1;
++    key[19] = 4; key[20] = 1; key[21] = 2; key[24] = 47;
++    MovePlyType moves{};
++    moves.last = 0; moves.move[0].suit = 0; moves.move[0].rank = 14;
++    const auto x = dds_proof::features(key, moves);
++    EXPECT_EQ(x[12], 1);
++    EXPECT_EQ(x[208], 1);
++    EXPECT_FLOAT_EQ(x[373], 7.0f / 13);
++    EXPECT_EQ(x[387], 1);
++}
++
++TEST(ProofModel, RejectsInvalidNetworkHeader)
++{
++    EXPECT_THROW(dds_proof::Model("/nonexistent/proof-model"), std::runtime_error);
++}
