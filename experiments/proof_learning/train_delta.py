@@ -35,6 +35,17 @@ def baseline_loss(*data):
     return loss_parts(model, *data)[0]
 
 
+def checked_partition(rows, splits, min_train_families):
+    if any(s not in {'train','validation','test'} for s in splits.values()):
+        raise ValueError('Invalid family partition')
+    groups, report = partition(rows, splits)
+    if any(not rs for rs in groups.values()):raise ValueError('Empty partition after deduplication')
+    count=len({r['family'] for r in groups['train']})
+    if count < min_train_families:
+        raise ValueError(f'Only {count} independent training families; require {min_train_families}')
+    return groups, report
+
+
 def initialize(seed):
     rng = np.random.default_rng(seed)
     w = [rng.normal(0, np.sqrt(2 / 480), (480, 64)).astype(np.float32), np.zeros(64, np.float32),
@@ -85,10 +96,13 @@ def tensors(rows, scale):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('dataset'); p.add_argument('output'); p.add_argument('--epochs', type=int, default=80)
+    p.add_argument('--splits', help='Frozen manifest containing family_splits')
+    p.add_argument('--min-train-families',type=int,default=1)
     args = p.parse_args()
     rows = [json.loads(x) for x in Path(args.dataset).read_text().splitlines()]
-    splits = split_families(r['family'] for r in rows)
-    groups, deduplication = partition(rows, splits)
+    splits = (json.loads(Path(args.splits).read_text())['family_splits'] if args.splits
+              else split_families(r['family'] for r in rows))
+    groups, deduplication = checked_partition(rows, splits, args.min_train_families)
     scale = np.median([r['baseline_nodes'] for r in groups['train']])
     data = {s: tensors(rs, scale) for s, rs in groups.items()}
     model = initialize(7411); rng = np.random.default_rng(7411)
@@ -108,6 +122,7 @@ def main():
     report = dict(parameters=sum(w.size for w in model['w']), best_epoch=best_epoch,
                   deduplication=deduplication,
                   family_splits=splits, rows={s:len(r) for s,r in groups.items()},
+                  independent_families={s:len({r['family'] for r in rs}) for s,rs in groups.items()},
                   selected_label_loss={s:loss_parts(model,*d)[0] for s,d in data.items()},
                   baseline_label_loss={s:baseline_loss(*d) for s,d in data.items()},
                   validation_history=history,

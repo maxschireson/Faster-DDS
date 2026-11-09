@@ -1,9 +1,18 @@
 import unittest
 import numpy as np
-from train_delta import encode, initialize, step, predict, partition, baseline_loss, loss_parts
+from train_delta import encode, initialize, step, predict, partition, baseline_loss, loss_parts, checked_partition
 
 
 class DeltaTest(unittest.TestCase):
+    def test_fixed_family_assignment_survives_subsampling_and_enforces_training_minimum(self):
+        rows=[dict(family=f,root=i,decision_index=1,key=[i],stock_order=[1,2]) for i,f in enumerate('abcd')]
+        splits=dict(a='test',b='train',c='validation',d='train')
+        groups,_=checked_partition(rows,splits,2)
+        self.assertEqual({r['family'] for r in groups['train']},{'b','d'})
+        with self.assertRaises(ValueError):checked_partition(rows,splits,1000)
+        reduced,_=checked_partition(rows[:3],splits,1)
+        self.assertEqual(reduced['test'][0]['family'],'a')
+
     def test_partition_removes_duplicate_observations_and_cross_split_states(self):
         rows = [dict(family=f, root=i, decision_index=1, key=[i], stock_order=[1, 2]) for i,f in enumerate('abcdefghij')]
         from pipeline import split_families
