@@ -148,6 +148,45 @@ are excluded from this repository; the pilot checkpoint is saved separately.
 
 ## Next learning iteration
 
+### Root-only, large-request follow-up
+
+The captured 10-board production workload concentrates time in large DDS
+requests, after existing cache hits and duplicate worlds are accounted for:
+
+| Remaining tricks | Share of DDS-call CPU time | Share of native solves |
+| --- | ---: | ---: |
+| 13 | 53.0% | 4.7% |
+| 12–13 | 70.8% | 9.6% |
+| 11–13 | 81.7% | 16.0% |
+| 10–13 | 87.8% | 23.7% |
+
+These times include the DDS caller's packing/cache work. A remaining-tricks
+bucket includes positions within the current trick, not just complete hands.
+On this sample, a 30-microsecond prediction once per native request with at
+least ten tricks remaining would add 0.217 seconds against 51.48 seconds in
+that group, about 0.42%. Cache hits should bypass prediction entirely.
+
+The evaluator now supports `[CAP] [LEVELS] [MIN_TRICKS]`. For example:
+
+```bash
+/path/to/proof_learning evaluate run/all.roots run/root-only.jsonl run/model/model.txt 1 1 10
+```
+
+This allows at most one prediction at the exact root depth and skips smaller
+requests. A regression test checks zero small-request calls and records the
+minimum/maximum actual inference depths to verify no child was queried.
+All seven Python/unit/integration tests passed after this change.
+
+Reusing the first model across all 1,000 development requests produced 423
+eligible large requests and 577 skipped smaller requests. All-move results
+matched exactly. Large-request recursive work increased 0.21% and measured
+time increased 1.34%; there is still no demonstrated improvement. On the 68
+eligible requests from the previously held-out family, time was essentially
+unchanged (1.0006x), with 0.086% fewer nodes. This follow-up is development
+analysis reusing the same families, not a fresh confirmation test. The gate
+improves inference economics; a better policy or richer root-level proposal is
+still required. `root_only_summary.json` preserves aggregate measurements.
+
 Collect more independent self-play families before expanding the number of
 nearby positions per family. Add DDS's existing move order as an input/prior so
 the network learns when to improve it. Then compare direct cheapest-successful

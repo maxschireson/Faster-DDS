@@ -15,10 +15,10 @@ index 1543f67..2b9709b 100644
 +)
 diff --git a/benchmarks/proof_learning.cpp b/benchmarks/proof_learning.cpp
 new file mode 100644
-index 0000000..a6325ee
+index 0000000..32137db
 --- /dev/null
 +++ b/benchmarks/proof_learning.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,231 @@
 +// Offline self-play scavenger. Every output remains an exact DDS result.
 +#include <proof_model.hpp>
 +#include <research_teacher.hpp>
@@ -101,12 +101,16 @@ index 0000000..a6325ee
 +    const dds_proof::Model& model;
 +    int calls = 0;
 +    int cap = 8;
++    int min_depth = 99;
++    int max_depth = -1;
 +    static auto choose(const dds_research::Key& key, const MovePlyType& moves, void* context)
 +        -> dds_research::Hint
 +    {
 +        auto& self = *static_cast<ModelHook*>(context);
 +        if (self.calls >= self.cap) return {-1, 0, 0};
 +        ++self.calls;
++        self.min_depth = std::min(self.min_depth, static_cast<int>(key[24]));
++        self.max_depth = std::max(self.max_depth, static_cast<int>(key[24]));
 +        return self.model.choose(key, moves);
 +    }
 +};
@@ -155,10 +159,14 @@ index 0000000..a6325ee
 +        if (argc == 5 && std::string(argv[1]) == "infer") {
 +            infer(argv[2], argv[3], argv[4]); return 0;
 +        }
-+        if (argc < 4) throw std::runtime_error("Usage: proof_learning collect|evaluate ROOTS OUTPUT [MODEL] [CAP]");
++        if (argc < 4) throw std::runtime_error("Usage: proof_learning collect|evaluate ROOTS OUTPUT [MODEL] [CAP] [LEVELS] [MIN_TRICKS]");
 +        const bool collect = std::string(argv[1]) == "collect";
 +        if (!collect && (std::string(argv[1]) != "evaluate" || argc < 5))
 +            throw std::runtime_error("Invalid command");
++        const int levels = argc > 6 ? std::stoi(argv[6]) : 5;
++        const int min_tricks = argc > 7 ? std::stoi(argv[7]) : 1;
++        if (levels < 1 || levels > 49 || min_tricks < 1 || min_tricks > 13)
++            throw std::runtime_error("Invalid root gate");
 +        std::ifstream input(argv[2]);
 +        std::ofstream output(argv[3]);
 +        if (!input || !output) throw std::runtime_error("Cannot open input/output");
@@ -197,25 +205,29 @@ index 0000000..a6325ee
 +                double baseline_time = 0, model_time = 0;
 +                std::uint64_t baseline_nodes = 0, model_nodes = 0;
 +                int calls = 0;
++                int min_model_depth = 99, max_model_depth = -1;
 +                // Alternate order; repeat to reduce noise on small calls.
 +                for (int repeat = 0; repeat < 3; ++repeat) {
 +                    std::array<int, 52> reference{}, guided{};
 +                    for (int pass = 0; pass < 2; ++pass) {
 +                        const bool use_model = (pass + repeat + count) % 2;
++                        const bool enabled = use_model && (key[24] + 7) / 4 >= min_tricks;
 +                        dds_research::Research state;
 +                        state.learn = false;
-+                        state.count_only = !use_model;
++                        state.count_only = !enabled;
 +                        ModelHook hook{*model};
 +                        if (argc > 5) hook.cap = std::stoi(argv[5]);
-+                        state.min_depth = std::max(0, static_cast<int>(key[24]) - 4);
-+                        state.apply = use_model;
-+                        state.teacher_hook = use_model ? &ModelHook::choose : nullptr;
++                        state.min_depth = std::max(0, static_cast<int>(key[24]) - levels + 1);
++                        state.apply = enabled;
++                        state.teacher_hook = enabled ? &ModelHook::choose : nullptr;
 +                        state.teacher_context = &hook;
 +                        const double start = cpu_seconds();
 +                        const auto result = solve(baseline_context, deal, &state);
 +                        const double elapsed = cpu_seconds() - start;
 +                        if (use_model) {
 +                            guided = scores(result); model_time += elapsed; model_nodes += state.nodes; calls += hook.calls;
++                            min_model_depth = std::min(min_model_depth, hook.min_depth);
++                            max_model_depth = std::max(max_model_depth, hook.max_depth);
 +                        } else { reference = scores(result); baseline_time += elapsed; baseline_nodes += state.nodes; }
 +                    }
 +                    if (reference != guided) throw std::runtime_error("Model changed exact all-move scores");
@@ -223,7 +235,9 @@ index 0000000..a6325ee
 +                output << "{\"family\":\"" << family << "\",\"root\":" << root
 +                    << ",\"baseline_seconds\":" << baseline_time << ",\"model_seconds\":" << model_time
 +                    << ",\"baseline_nodes\":" << baseline_nodes << ",\"model_nodes\":" << model_nodes
-+                    << ",\"model_calls\":" << calls << ",\"all_moves_equal\":true}\n";
++                    << ",\"model_calls\":" << calls << ",\"root_depth\":" << key[24]
++                    << ",\"min_model_depth\":" << min_model_depth << ",\"max_model_depth\":" << max_model_depth
++                    << ",\"all_moves_equal\":true}\n";
 +            }
 +            output.flush();
 +            if (++count % 25 == 0) std::cerr << "processed " << count << " roots\n";

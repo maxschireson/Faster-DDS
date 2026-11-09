@@ -12,6 +12,26 @@ from pipeline import features, forward
 
 @unittest.skipUnless(os.environ.get('DDS_PROOF_BINARY'), 'native fixture not supplied')
 class NativeTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
+    def test_root_only_gate_skips_small_requests_and_never_enters_children(self):
+        rows = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
+        chosen = []
+        for large in [False, True]:
+            chosen.append(next(r for r in rows if ((int(r.split()[26]) + 7) // 4 >= 10) == large))
+        with tempfile.TemporaryDirectory() as directory:
+            source, result = Path(directory) / 'roots', Path(directory) / 'results'
+            source.write_text('\n'.join(chosen) + '\n')
+            subprocess.run([os.environ['DDS_PROOF_BINARY'], 'evaluate', str(source), str(result),
+                            os.environ['DDS_PROOF_MODEL'], '1', '1', '10'], check=True)
+            outputs = [json.loads(r) for r in result.read_text().splitlines()]
+            self.assertEqual(outputs[0]['model_calls'], 0)
+            for row in outputs:
+                self.assertTrue(row['all_moves_equal'])
+                self.assertLessEqual(row['model_calls'], 3)
+                if row['model_calls']:
+                    self.assertEqual(row['min_model_depth'], row['root_depth'])
+                    self.assertEqual(row['max_model_depth'], row['root_depth'])
+
     @unittest.skipUnless(os.environ.get('DDS_PROOF_REFERENCE'), 'reference DDS not supplied')
     def test_cutoff_labels_match_independent_exact_all_move_scores(self):
         class Deal(C.Structure):
