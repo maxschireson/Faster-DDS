@@ -4,6 +4,12 @@ This prototype scavenges existing self-play DDS requests, replays a bounded
 subset offline to obtain proof-cost supervision, and trains a small CPU model.
 It is an isolated experiment, not enabled in the production bridge arena.
 
+The [early-refutation follow-up](refutation_study.md) adds recording of failed
+children, reply moves, return reasons, and nonoverlapping dead-end origin costs.
+It profiles 423 large self-play requests and compares hindsight guidance over
+three card plays versus three tricks. No conditional early-trick model has yet
+been trained from those new records.
+
 ## Exact task
 
 For a DDS state and a trick threshold, predict for each legal representative

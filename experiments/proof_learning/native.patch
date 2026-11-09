@@ -15,10 +15,10 @@ index 1543f67..2b9709b 100644
 +)
 diff --git a/benchmarks/proof_learning.cpp b/benchmarks/proof_learning.cpp
 new file mode 100644
-index 0000000..32137db
+index 0000000..9dd49f0
 --- /dev/null
 +++ b/benchmarks/proof_learning.cpp
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,314 @@
 +// Offline self-play scavenger. Every output remains an exact DDS result.
 +#include <proof_model.hpp>
 +#include <research_teacher.hpp>
@@ -96,6 +96,24 @@ index 0000000..32137db
 +    out << "]}\n";
 +}
 +
++auto write_observation(std::ostream& out, const std::string& family, int root,
++                       int root_depth, const dds_research::Decision& decision) -> void
++{
++    out << "{\"family\":\"" << family << "\",\"root\":" << root << ",\"key\":[";
++    for (std::size_t i = 0; i < decision.key.size(); ++i) out << (i ? "," : "") << decision.key[i];
++    out << "],\"ply_from_root\":" << root_depth - decision.key[24]
++        << ",\"parent_nodes\":" << decision.cost << ",\"legal\":[";
++    for (std::size_t i = 0; i < decision.moves.size(); ++i)
++        out << (i ? "," : "") << decision.moves[i].suit * 13 + decision.moves[i].rank - 2;
++    out << "],\"observed\":[";
++    for (std::size_t i = 0; i < decision.observed.size(); ++i) {
++        const auto& c = decision.observed[i];
++        out << (i ? "," : "") << '[' << c.card << ',' << c.cutoff << ',' << c.nodes
++            << ',' << static_cast<int>(c.reason) << ',' << c.max_target_holds << ',' << c.reply_card << ']';
++    }
++    out << "]}\n";
++}
++
 +struct ModelHook
 +{
 +    const dds_proof::Model& model;
@@ -151,16 +169,62 @@ index 0000000..32137db
 +        << ",\"choices\":" << 100 * cases.size() << ",\"checksum\":" << checksum << "}\n";
 +}
 +
++auto oracle(const std::string& input_path, const std::string& output_path) -> void
++{
++    std::ifstream input(input_path);
++    std::ofstream output(output_path);
++    if (!input || !output) throw std::runtime_error("Cannot open oracle files");
++    init_lookup_tables();
++    SolverContext context;
++    std::string family;
++    int root = 0;
++    while (input >> family >> root) {
++        dds_research::Key key{};
++        for (auto& word : key) if (!(input >> word)) throw std::runtime_error("Truncated oracle root");
++        if ((key[24] + 7) / 4 < 10) continue;
++        const auto deal = dds_research::deal_from_key(key);
++        dds_research::Research baseline;
++        baseline.count_only = true;
++        const auto reference = solve(context, deal, &baseline);
++        for (int horizon = 0; horizon < 2; ++horizon) {
++            dds_research::Research hints;
++            hints.min_depth = horizon ? 4 * ((key[24] + 7) / 4) - 15 : key[24] - 2;
++            std::uint64_t teacher_nodes = 0;
++            for (int pass = 0; pass < 3; ++pass) {
++                hints.reset_counts();
++                hints.apply = pass > 0;
++                const auto result = solve(context, deal, &hints);
++                if (scores(result) != scores(reference)) throw std::runtime_error("Teacher changed all-move result");
++                teacher_nodes += hints.nodes;
++            }
++            hints.learn = false;
++            hints.reset_counts();
++            const auto result = solve(context, deal, &hints);
++            if (scores(result) != scores(reference)) throw std::runtime_error("Oracle changed all-move result");
++            output << "{\"family\":\"" << family << "\",\"root\":" << root
++                << ",\"horizon\":\"" << (horizon ? "3_tricks" : "3_plays")
++                << "\",\"baseline_nodes\":" << baseline.nodes << ",\"hint_nodes\":" << hints.nodes
++                << ",\"teacher_nodes\":" << teacher_nodes << ",\"hint_queries\":" << hints.lookups
++                << ",\"all_moves_equal\":true}\n";
++        }
++        output.flush();
++    }
++}
++
 +} // namespace
 +
 +auto main(int argc, char** argv) -> int
 +{
 +    try {
++        if (argc == 4 && std::string(argv[1]) == "oracle") {
++            oracle(argv[2], argv[3]); return 0;
++        }
 +        if (argc == 5 && std::string(argv[1]) == "infer") {
 +            infer(argv[2], argv[3], argv[4]); return 0;
 +        }
 +        if (argc < 4) throw std::runtime_error("Usage: proof_learning collect|evaluate ROOTS OUTPUT [MODEL] [CAP] [LEVELS] [MIN_TRICKS]");
-+        const bool collect = std::string(argv[1]) == "collect";
++        const bool profile = std::string(argv[1]) == "refutations";
++        const bool collect = std::string(argv[1]) == "collect" || profile;
 +        if (!collect && (std::string(argv[1]) != "evaluate" || argc < 5))
 +            throw std::runtime_error("Invalid command");
 +        const int levels = argc > 6 ? std::stoi(argv[6]) : 5;
@@ -169,6 +233,8 @@ index 0000000..32137db
 +            throw std::runtime_error("Invalid root gate");
 +        std::ifstream input(argv[2]);
 +        std::ofstream output(argv[3]);
++        std::ofstream profiles;
++        if (profile) profiles.open(std::string(argv[3]) + ".profiles.jsonl");
 +        if (!input || !output) throw std::runtime_error("Cannot open input/output");
 +        init_lookup_tables();
 +        SolverContext baseline_context, shadow;
@@ -183,23 +249,40 @@ index 0000000..32137db
 +            if (key[17] > 3 || key[18] > 3 || key[19] > 4 || key[24] > 48)
 +                throw std::runtime_error("Invalid root metadata");
 +            const auto deal = dds_research::deal_from_key(key);
++            if (profile && (key[24] + 7) / 4 < 10) continue;
 +            if (collect) {
 +                dds_research::Research research;
 +                research.learn = false;
 +                research.collect_decisions = true;
-+                research.min_depth = std::max(0, static_cast<int>(key[24]) - 4);
++                research.profile_deadends = profile;
++                research.root_depth = key[24];
++                research.min_depth = profile ? 4 * ((key[24] + 7) / 4) - 15 :
++                    std::max(0, static_cast<int>(key[24]) - 4);
 +                research.decision_min_nodes = 64;
-+                const auto reference = solve(baseline_context, deal, nullptr);
++                dds_research::Research baseline;
++                baseline.count_only = true;
++                const auto reference = solve(baseline_context, deal, &baseline);
 +                const auto instrumented = solve(baseline_context, deal, &research);
 +                if (scores(reference) != scores(instrumented)) throw std::runtime_error("Collector changed scores");
++                if (baseline.nodes != research.nodes) throw std::runtime_error("Collector changed search nodes");
++                if (profile) {
++                    profiles << "{\"family\":\"" << family << "\",\"root\":" << root
++                        << ",\"root_depth\":" << key[24] << ",\"nodes\":" << research.nodes
++                        << ",\"deadends_by_ply\":[";
++                    for (int ply = 0; ply <= key[24]; ++ply)
++                        profiles << (ply ? "," : "") << research.deadends_by_origin[key[24] - ply];
++                    profiles << "],\"all_moves_equal\":true}\n";
++                    profiles.flush();
++                }
 +                std::stable_sort(research.decisions.begin(), research.decisions.end(),
 +                    [](const auto& a, const auto& b) { return a.cost > b.cost; });
 +                int emitted = 0;
 +                for (const auto& decision : research.decisions) {
 +                    // Deduplicate exact states before partitioning by family.
 +                    if (!seen.insert(decision.key).second) continue;
-+                    label(output, family, root, decision, shadow);
-+                    if (++emitted == 8) break;
++                    if (profile) write_observation(output, family, root, key[24], decision);
++                    else label(output, family, root, decision, shadow);
++                    if (++emitted == (profile ? 64 : 8)) break;
 +                }
 +            } else {
 +                double baseline_time = 0, model_time = 0;
@@ -251,7 +334,7 @@ index 0000000..32137db
 +    return 0;
 +}
 diff --git a/library/src/ab_search.cpp b/library/src/ab_search.cpp
-index a487262..3b37b8a 100644
+index a487262..feafdf4 100644
 --- a/library/src/ab_search.cpp
 +++ b/library/src/ab_search.cpp
 @@ -10,6 +10,7 @@
@@ -297,7 +380,19 @@ index a487262..3b37b8a 100644
          if (value == success) /* A cut-off? */
          {
              for (int ss = 0; ss < DDS_SUITS; ss++)
-@@ -306,6 +314,7 @@ static bool ab_search_0_ctx(
+@@ -275,7 +283,10 @@ ABexit:
+     thrp->ABStats.PrintStats(thrp->fileABstats.GetStream());
+ #endif
+ 
+-    return value;
++    const auto& proof_move = ctx.search().best_move(depth);
++    return dds_research::resolved(depth, value,
++        value == success ? dds_research::ReturnReason::MoveCutoff : dds_research::ReturnReason::Exhausted,
++        value == success ? proof_move.suit * 13 + proof_move.rank - 2 : -1);
+ }
+ 
+ 
+@@ -306,6 +317,7 @@ static bool ab_search_0_ctx(
      int hand = posPoint->first[depth];
      int tricks = depth >> 2;
  
@@ -305,7 +400,83 @@ index a487262..3b37b8a 100644
  #ifdef DDS_TOP_LEVEL
      ctx.search().nodes()++;
  #endif
-@@ -414,6 +423,8 @@ static bool ab_search_0_ctx(
+@@ -317,18 +329,18 @@ static bool ab_search_0_ctx(
+     {
+         bool scoreFlag;
+         if (apply_ab_tt_lookup(posPoint, target, depth, tricks, hand, ctx, scoreFlag))
+-            return scoreFlag;
++            return dds_research::resolved(depth, scoreFlag, dds_research::ReturnReason::Transposition);
+     }
+ 
+     if (posPoint->tricks_max >= target)
+     {
+         AB_COUNT(AB_TARGET_REACHED, true, depth);
+-        return true;
++        return dds_research::resolved(depth, true, dds_research::ReturnReason::Target);
+     }
+     else if (posPoint->tricks_max + tricks + 1 < target)
+     {
+         AB_COUNT(AB_TARGET_REACHED, false, depth);
+-        return false;
++        return dds_research::resolved(depth, false, dds_research::ReturnReason::Target);
+     }
+     else if (depth == 0) /* Maximum depth? */
+     {
+@@ -342,7 +354,7 @@ static bool ab_search_0_ctx(
+             posPoint->win_ranks[depth][ss] = evalData.win_ranks[ss];
+ 
+         AB_COUNT(AB_DEPTH_ZERO, value, depth);
+-        return value;
++        return dds_research::resolved(depth, value, dds_research::ReturnReason::Endgame);
+     }
+ 
+     bool res;
+@@ -356,7 +368,7 @@ static bool ab_search_0_ctx(
+         if (res)
+         {
+             AB_COUNT(AB_QUICKTRICKS, 1, depth);
+-            return (qtricks == 0 ? false : true);
++            return dds_research::resolved(depth, qtricks != 0, dds_research::ReturnReason::QuickTricks);
+         }
+ 
+     TIMER_START(TIMER_NO_LT, depth);
+@@ -366,7 +378,7 @@ static bool ab_search_0_ctx(
+         if (! res)
+         {
+             AB_COUNT(AB_LATERTRICKS, true, depth);
+-            return false;
++            return dds_research::resolved(depth, false, dds_research::ReturnReason::LaterTricks);
+         }
+     }
+     else
+@@ -374,7 +386,7 @@ static bool ab_search_0_ctx(
+         if (res)
+         {
+             AB_COUNT(AB_QUICKTRICKS, false, depth);
+-            return (qtricks == 0 ? true : false);
++            return dds_research::resolved(depth, qtricks == 0, dds_research::ReturnReason::QuickTricks);
+         }
+ 
+     TIMER_START(TIMER_NO_LT, depth);
+@@ -384,7 +396,7 @@ static bool ab_search_0_ctx(
+         if (res)
+         {
+             AB_COUNT(AB_LATERTRICKS, false, depth);
+-            return true;
++            return dds_research::resolved(depth, true, dds_research::ReturnReason::LaterTricks);
+         }
+     }
+ 
+@@ -392,7 +404,7 @@ static bool ab_search_0_ctx(
+     {
+         bool scoreFlag;
+         if (apply_ab_tt_lookup(posPoint, target, depth, tricks, hand, ctx, scoreFlag))
+-            return scoreFlag;
++            return dds_research::resolved(depth, scoreFlag, dds_research::ReturnReason::Transposition);
+     }
+ 
+     bool success = (ctx.search().node_type_store(hand) == MAXNODE ? true : false);
+@@ -414,6 +426,8 @@ static bool ab_search_0_ctx(
      for (int ss = 0; ss < DDS_SUITS; ss++)
          posPoint->win_ranks[depth][ss] = 0;
  
@@ -314,7 +485,7 @@ index a487262..3b37b8a 100644
      while (1)
      {
          TIMER_START(TIMER_NO_MAKE, depth);
-@@ -427,6 +438,8 @@ static bool ab_search_0_ctx(
+@@ -427,6 +441,8 @@ static bool ab_search_0_ctx(
          if (mply == NULL)
              break;
  
@@ -323,7 +494,7 @@ index a487262..3b37b8a 100644
          make_0(posPoint, depth, mply);
  
          TIMER_START(TIMER_NO_AB, depth - 1);
-@@ -437,6 +450,8 @@ static bool ab_search_0_ctx(
+@@ -437,6 +453,8 @@ static bool ab_search_0_ctx(
          undo_1(posPoint, depth, * mply);
          TIMER_END(TIMER_NO_UNDO, depth);
  
@@ -332,7 +503,19 @@ index a487262..3b37b8a 100644
          if (value == success) /* A cut-off? */
          {
              for (int ss = 0; ss < DDS_SUITS; ss++)
-@@ -488,6 +503,7 @@ static bool ab_search_1_ctx(
+@@ -462,7 +480,10 @@ ABexit:
+         posPoint, target, depth, tricks, hand, value, ctx, posPoint->win_ranks[depth]);
+ 
+     AB_COUNT(AB_MOVE_LOOP, value, depth);
+-    return value;
++    const auto& proof_move = ctx.search().best_move(depth);
++    return dds_research::resolved(depth, value,
++        value == success ? dds_research::ReturnReason::MoveCutoff : dds_research::ReturnReason::Exhausted,
++        value == success ? proof_move.suit * 13 + proof_move.rank - 2 : -1);
+ }
+ 
+ 
+@@ -488,6 +509,7 @@ static bool ab_search_1_ctx(
      bool value = ! success;
      int tricks = (depth + 3) >> 2;
  
@@ -340,7 +523,16 @@ index a487262..3b37b8a 100644
  #ifdef DDS_TOP_LEVEL
      ctx.search().nodes()++;
  #endif
-@@ -514,6 +530,8 @@ static bool ab_search_1_ctx(
+@@ -498,7 +520,7 @@ static bool ab_search_1_ctx(
+     if (res) 
+     {
+         AB_COUNT(AB_QUICKTRICKS_2ND, true, depth);
+-        return success;
++        return dds_research::resolved(depth, success, dds_research::ReturnReason::QuickTricks);
+     }
+ 
+     TIMER_START(TIMER_NO_MOVEGEN, depth);
+@@ -514,6 +536,8 @@ static bool ab_search_1_ctx(
      for (int ss = 0; ss < DDS_SUITS; ss++)
          posPoint->win_ranks[depth][ss] = 0;
  
@@ -349,7 +541,7 @@ index a487262..3b37b8a 100644
      while (1)
      {
          TIMER_START(TIMER_NO_MAKE, depth);
-@@ -526,6 +544,8 @@ static bool ab_search_1_ctx(
+@@ -526,6 +550,8 @@ static bool ab_search_1_ctx(
          if (mply == NULL)
              break;
  
@@ -358,7 +550,7 @@ index a487262..3b37b8a 100644
          make_1(posPoint, depth, mply);
  
          TIMER_START(TIMER_NO_AB, depth - 1);
-@@ -536,6 +556,8 @@ static bool ab_search_1_ctx(
+@@ -536,6 +562,8 @@ static bool ab_search_1_ctx(
          undo_2(posPoint, depth, * mply);
          TIMER_END(TIMER_NO_UNDO, depth);
  
@@ -367,7 +559,19 @@ index a487262..3b37b8a 100644
          if (value == success) /* A cut-off? */
          {
              for (int ss = 0; ss < DDS_SUITS; ss++)
-@@ -585,6 +607,7 @@ static bool ab_search_2_ctx(
+@@ -558,7 +586,10 @@ static bool ab_search_1_ctx(
+ 
+ ABexit:
+     AB_COUNT(AB_MOVE_LOOP, value, depth);
+-    return value;
++    const auto& proof_move = ctx.search().best_move(depth);
++    return dds_research::resolved(depth, value,
++        value == success ? dds_research::ReturnReason::MoveCutoff : dds_research::ReturnReason::Exhausted,
++        value == success ? proof_move.suit * 13 + proof_move.rank - 2 : -1);
+ }
+ 
+ 
+@@ -585,6 +616,7 @@ static bool ab_search_2_ctx(
      bool value = ! success;
      int tricks = (depth + 3) >> 2;
  
@@ -375,7 +579,7 @@ index a487262..3b37b8a 100644
  #ifdef DDS_TOP_LEVEL
      ctx.search().nodes()++;
  #endif
-@@ -602,6 +625,8 @@ static bool ab_search_2_ctx(
+@@ -602,6 +634,8 @@ static bool ab_search_2_ctx(
      for (int ss = 0; ss < DDS_SUITS; ss++)
          posPoint->win_ranks[depth][ss] = 0;
  
@@ -384,7 +588,7 @@ index a487262..3b37b8a 100644
      while (1)
      {
          TIMER_START(TIMER_NO_MAKE, depth);
-@@ -610,6 +635,8 @@ static bool ab_search_2_ctx(
+@@ -610,6 +644,8 @@ static bool ab_search_2_ctx(
          if (mply == NULL)
              break;
  
@@ -393,7 +597,7 @@ index a487262..3b37b8a 100644
          make_2(posPoint, depth, mply);
  
  #ifdef DDS_AB_STATS
-@@ -625,6 +652,8 @@ static bool ab_search_2_ctx(
+@@ -625,6 +661,8 @@ static bool ab_search_2_ctx(
          undo_3(posPoint, depth, * mply);
          TIMER_END(TIMER_NO_UNDO, depth);
  
@@ -402,7 +606,19 @@ index a487262..3b37b8a 100644
          if (value == success) /* A cut-off? */
          {
              for (int ss = 0; ss < DDS_SUITS; ss++)
-@@ -677,6 +706,7 @@ static bool ab_search_3_ctx(
+@@ -647,7 +685,10 @@ static bool ab_search_2_ctx(
+ 
+ ABexit:
+     AB_COUNT(AB_MOVE_LOOP, value, depth);
+-    return value;
++    const auto& proof_move = ctx.search().best_move(depth);
++    return dds_research::resolved(depth, value,
++        value == success ? dds_research::ReturnReason::MoveCutoff : dds_research::ReturnReason::Exhausted,
++        value == success ? proof_move.suit * 13 + proof_move.rank - 2 : -1);
+ }
+ 
+ 
+@@ -677,6 +718,7 @@ static bool ab_search_3_ctx(
      bool success = (ctx.search().node_type_store(hand) == MAXNODE ? true : false);
      bool value = ! success;
  
@@ -410,7 +626,7 @@ index a487262..3b37b8a 100644
  #ifdef DDS_TOP_LEVEL
      ctx.search().nodes()++;
  #endif
-@@ -695,6 +725,8 @@ static bool ab_search_3_ctx(
+@@ -695,6 +737,8 @@ static bool ab_search_3_ctx(
      for (int ss = 0; ss < DDS_SUITS; ss++)
          posPoint->win_ranks[depth][ss] = 0;
  
@@ -419,7 +635,7 @@ index a487262..3b37b8a 100644
      while (1)
      {
          TIMER_START(TIMER_NO_MAKE, depth);
-@@ -707,6 +739,8 @@ static bool ab_search_3_ctx(
+@@ -707,6 +751,8 @@ static bool ab_search_3_ctx(
          if (mply == NULL)
              break;
  
@@ -428,7 +644,7 @@ index a487262..3b37b8a 100644
      make_3(posPoint, makeWinRank, depth, mply, ctx);
  
          ctx.search().trick_nodes()++; // As hand_rel_first == 0
-@@ -726,6 +760,8 @@ static bool ab_search_3_ctx(
+@@ -726,6 +772,8 @@ static bool ab_search_3_ctx(
  
          TIMER_END(TIMER_NO_UNDO, depth);
  
@@ -437,6 +653,18 @@ index a487262..3b37b8a 100644
          if (value == success) /* A cut-off? */
          {
              for (int ss = 0; ss < DDS_SUITS; ss++)
+@@ -748,7 +796,10 @@ static bool ab_search_3_ctx(
+ 
+ ABexit:
+     AB_COUNT(AB_MOVE_LOOP, value, depth);
+-    return value;
++    const auto& proof_move = ctx.search().best_move(depth);
++    return dds_research::resolved(depth, value,
++        value == success ? dds_research::ReturnReason::MoveCutoff : dds_research::ReturnReason::Exhausted,
++        value == success ? proof_move.suit * 13 + proof_move.rank - 2 : -1);
+ }
+ 
+ void make_0(
 diff --git a/library/src/proof_model.hpp b/library/src/proof_model.hpp
 new file mode 100644
 index 0000000..20164e6
@@ -548,10 +776,10 @@ index 0000000..20164e6
 +} // namespace dds_proof
 diff --git a/library/src/research_order.hpp b/library/src/research_order.hpp
 new file mode 100644
-index 0000000..470ca4e
+index 0000000..53d887b
 --- /dev/null
 +++ b/library/src/research_order.hpp
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,325 @@
 +#pragma once
 +
 +// Experimental instrumentation, not part of the public DDS API.
@@ -560,6 +788,7 @@ index 0000000..470ca4e
 +#include <cstdint>
 +#include <unordered_map>
 +#include <stdexcept>
++#include <optional>
 +#include <vector>
 +#include <solver_context/solver_context.hpp>
 +
@@ -624,11 +853,56 @@ index 0000000..470ca4e
 +
 +struct Hint { int suit; int rank; std::uint64_t cost; };
 +
++using CostProfile = std::array<std::uint64_t, 50>;
++
++// This is an accounting decomposition of executed search, not a prediction
++// that changing one move would preserve every downstream transposition.
++struct BranchProfile
++{
++    CostProfile costs{};
++    std::uint64_t failed_prefix_nodes = 0;
++
++    auto add_child(bool cutoff, std::uint64_t nodes, const CostProfile& child, int depth) -> void
++    {
++        if (cutoff) {
++            // A successful alternative makes the earlier failed children
++            // avoidable. Attribute their entire subtrees here, not twice.
++            costs = child;
++            costs[depth] += failed_prefix_nodes;
++        } else {
++            failed_prefix_nodes += nodes;
++            for (std::size_t i = 0; i < costs.size(); ++i) costs[i] += child[i];
++        }
++    }
++};
++
++enum class ReturnReason { Unknown, Transposition, Target, Endgame, QuickTricks,
++                          LaterTricks, MoveCutoff, Exhausted };
++
++struct ReturnInfo
++{
++    ReturnReason reason = ReturnReason::Unknown;
++    bool max_target_holds = false;
++    int reply_card = -1;
++    CostProfile deadends{};
++};
++
++struct ChildObservation
++{
++    int card = -1;
++    bool cutoff = false;
++    std::uint64_t nodes = 0;
++    ReturnReason reason = ReturnReason::Unknown;
++    bool max_target_holds = false;
++    int reply_card = -1;
++};
++
 +struct Decision
 +{
 +    Key key{};
 +    std::vector<Hint> moves;
 +    std::uint64_t cost = 0;
++    std::vector<ChildObservation> observed;
 +};
 +
 +struct SearchLimitExceeded : std::runtime_error
@@ -649,6 +923,10 @@ index 0000000..470ca4e
 +    bool share_ns = false;
 +    bool count_only = false;
 +    bool collect_decisions = false;
++    bool profile_deadends = false;
++    int root_depth = 48;
++    std::array<ReturnInfo, 50> returns{};
++    CostProfile deadends_by_origin{};
 +    std::uint64_t decision_min_nodes = 16;
 +    std::uint64_t node_limit = 0;
 +    std::vector<Decision> decisions;
@@ -673,6 +951,8 @@ index 0000000..470ca4e
 +        lookups_by_depth.fill(0);
 +        trace_index = 0;
 +        decisions.clear();
++        returns = {};
++        deadends_by_origin.fill(0);
 +    }
 +
 +    auto remember(const Key& key, int suit, int rank, std::uint64_t cost) -> void
@@ -704,12 +984,29 @@ index 0000000..470ca4e
 +    }
 +}
 +
++inline auto resolved(int depth, bool value, ReturnReason reason, int reply_card = -1) -> bool
++{
++    if (active && active->profile_deadends) {
++        auto& result = active->returns[depth];
++        result = {};
++        result.reason = reason;
++        result.max_target_holds = value;
++        result.reply_card = reply_card;
++    }
++    return value;
++}
++
 +class Frame
 +{
 +public:
 +    Frame(const Pos& pos, int target, int depth, int rel, SolverContext& ctx)
 +    {
 +        if (!active || active->count_only) return;
++        if (active->profile_deadends) {
++            profile_state_ = active;
++            depth_ = depth;
++            profile_.emplace();
++        }
 +        auto& moves = ctx.thread_ptr()->moves;
 +        auto& list = moves.moveList[(depth+3)/4][rel];
 +        if (list.last < 1) return;
@@ -759,20 +1056,34 @@ index 0000000..470ca4e
 +
 +    ~Frame()
 +    {
++        if (profile_state_) {
++            profile_state_->returns[depth_].deadends = profile_->costs;
++            if (depth_ == profile_state_->root_depth)
++                for (std::size_t i = 0; i < profile_->costs.size(); ++i)
++                    profile_state_->deadends_by_origin[i] += profile_->costs[i];
++        }
 +        if (state_ && !choices_.empty() &&
 +            state_->nodes-subtree_start_ >= state_->decision_min_nodes)
-+            state_->decisions.push_back({key_, std::move(choices_), state_->nodes-subtree_start_});
++            state_->decisions.push_back({key_, std::move(choices_), state_->nodes-subtree_start_, std::move(observed_)});
 +    }
 +
 +    auto start_child() -> void
 +    {
-+        if (!state_) return;
-+        child_start_ = state_->nodes;
++        if (!state_ && !profile_state_) return;
++        child_start_ = (state_ ? state_ : profile_state_)->nodes;
 +        ++children_;
 +    }
 +
 +    auto child_done(const MoveType& move, bool success) -> void
 +    {
++        if (profile_state_) {
++            const auto cost = profile_state_->nodes - child_start_;
++            const auto& result = profile_state_->returns[depth_ - 1];
++            profile_->add_child(success, cost, result.deadends, depth_);
++            if (state_ && state_->collect_decisions)
++                observed_.push_back({move.suit * 13 + move.rank - 2, success, cost,
++                    result.reason, result.max_target_holds, result.reply_card});
++        }
 +        if (!state_ || !success) return;
 +        ++state_->cutoffs;
 +        state_->first_cutoffs += (children_ == 1);
@@ -782,11 +1093,15 @@ index 0000000..470ca4e
 +
 +private:
 +    Research* state_ = nullptr;
++    Research* profile_state_ = nullptr;
++    int depth_ = 0;
++    std::optional<BranchProfile> profile_;
 +    Key key_{};
 +    std::uint64_t child_start_ = 0;
 +    int children_ = 0;
 +    std::uint64_t subtree_start_ = 0;
 +    std::vector<Hint> choices_;
++    std::vector<ChildObservation> observed_;
 +};
 +
 +} // namespace dds_research
@@ -952,12 +1267,95 @@ index 48433aa..d08103a 100644
 +)
 diff --git a/library/tests/ab_search/proof_model_test.cpp b/library/tests/ab_search/proof_model_test.cpp
 new file mode 100644
-index 0000000..30faa0a
+index 0000000..f077b94
 --- /dev/null
 +++ b/library/tests/ab_search/proof_model_test.cpp
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,105 @@
 +#include <proof_model.hpp>
 +#include <gtest/gtest.h>
++#include <api/solve_board.hpp>
++#include <lookup_tables/lookup_tables.hpp>
++#include <numeric>
++#include <random>
++
++TEST(RefutationProfile, RecordsBothChildOutcomesWithoutChangingTheSearch)
++{
++    init_lookup_tables();
++    std::array<int, 52> deck{};
++    std::iota(deck.begin(), deck.end(), 0);
++    std::mt19937 rng(7391);
++    std::shuffle(deck.begin(), deck.end(), rng);
++    Deal deal{};
++    deal.trump = 4;
++    for (int h = 0; h < 4; ++h)
++        for (int j = 0; j < 13; ++j) {
++            const int c = deck[13 * h + j];
++            deal.remainCards[h][c / 13] |= 1u << (c % 13 + 2);
++        }
++    dds_research::Research plain, recorded;
++    plain.count_only = true;
++    recorded.learn = false;
++    recorded.profile_deadends = true;
++    recorded.collect_decisions = true;
++    recorded.min_depth = 37;
++    recorded.decision_min_nodes = 0;
++    FutureTricks expected{}, actual{};
++    for (int pass = 0; pass < 2; ++pass) {
++        SolverContext ctx;
++        dds_research::ActiveGuard guard(pass ? &recorded : &plain);
++        ASSERT_EQ(solve_board(ctx, deal, -1, 3, 1, pass ? &actual : &expected), RETURN_NO_FAULT);
++    }
++    EXPECT_EQ(recorded.nodes, plain.nodes);
++    ASSERT_EQ(actual.cards, expected.cards);
++    for (int i = 0; i < actual.cards; ++i) {
++        EXPECT_EQ(actual.suit[i], expected.suit[i]);
++        EXPECT_EQ(actual.rank[i], expected.rank[i]);
++        EXPECT_EQ(actual.equals[i], expected.equals[i]);
++        EXPECT_EQ(actual.score[i], expected.score[i]);
++    }
++    const auto wasted = std::accumulate(recorded.deadends_by_origin.begin(), recorded.deadends_by_origin.end(), std::uint64_t{0});
++    EXPECT_GT(wasted, 0u);
++    EXPECT_LE(wasted, recorded.nodes);
++    int failures = 0, successes = 0, replies = 0;
++    for (const auto& decision : recorded.decisions) {
++        EXPECT_GE(decision.key[24], 37);
++        std::uint64_t sum = 0;
++        for (const auto& child : decision.observed) {
++            EXPECT_NE(child.reason, dds_research::ReturnReason::Unknown);
++            sum += child.nodes;
++            failures += !child.cutoff; successes += child.cutoff;
++            replies += child.reply_card >= 0;
++        }
++        EXPECT_EQ(sum, decision.cost);
++    }
++    EXPECT_GT(failures, 0); EXPECT_GT(successes, 0); EXPECT_GT(replies, 0);
++}
++
++TEST(RefutationProfile, AttributesFailedSubtreeOnceAtItsEarliestAvoidableChoice)
++{
++    dds_research::BranchProfile parent;
++    dds_research::CostProfile inside_failure{}, inside_success{};
++    inside_failure[5] = 30;
++    inside_success[8] = 4;
++    parent.add_child(false, 100, inside_failure, 2);
++    parent.add_child(true, 20, inside_success, 2);
++    EXPECT_EQ(parent.costs[2], 100u);
++    EXPECT_EQ(parent.costs[5], 0u);
++    EXPECT_EQ(parent.costs[8], 4u);
++}
++
++TEST(RefutationProfile, NecessaryAllFailChildrenAreNotCalledAvoidableDeadEnds)
++{
++    dds_research::BranchProfile parent;
++    dds_research::CostProfile inside_failure{}, other{};
++    inside_failure[5] = 30;
++    other[8] = 4;
++    parent.add_child(false, 100, inside_failure, 2);
++    parent.add_child(false, 20, other, 2);
++    EXPECT_EQ(parent.costs[2], 0u);
++    EXPECT_EQ(parent.costs[5], 30u);
++    EXPECT_EQ(parent.costs[8], 4u);
++}
 +
 +TEST(ProofModel, RotatesHoldingsAndConditionsOnCurrentSideTarget)
 +{

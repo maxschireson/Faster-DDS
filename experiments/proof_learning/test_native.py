@@ -13,6 +13,39 @@ from pipeline import features, forward
 @unittest.skipUnless(os.environ.get('DDS_PROOF_BINARY'), 'native fixture not supplied')
 class NativeTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
+    def test_hindsight_oracle_still_verifies_every_move(self):
+        lines = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
+        chosen = next(r for r in lines if (int(r.split()[26]) + 7) // 4 >= 10)
+        with tempfile.TemporaryDirectory() as directory:
+            source, result = Path(directory) / 'roots', Path(directory) / 'oracle'
+            source.write_text(chosen + '\n')
+            subprocess.run([os.environ['DDS_PROOF_BINARY'], 'oracle', str(source), str(result)], check=True)
+            outputs = [json.loads(x) for x in result.read_text().splitlines()]
+            self.assertEqual({r['horizon'] for r in outputs}, {'3_plays', '3_tricks'})
+            self.assertTrue(all(r['all_moves_equal'] for r in outputs))
+            self.assertTrue(all(r['baseline_nodes'] > 0 and r['hint_nodes'] > 0 for r in outputs))
+
+    @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
+    def test_refutation_recording_preserves_scores_and_observed_label_masks(self):
+        lines = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
+        chosen = next(r for r in lines if (int(r.split()[26]) + 7) // 4 >= 10)
+        with tempfile.TemporaryDirectory() as directory:
+            source, result = Path(directory) / 'roots', Path(directory) / 'events.jsonl'
+            source.write_text(chosen + '\n')
+            subprocess.run([os.environ['DDS_PROOF_BINARY'], 'refutations', str(source), str(result)], check=True)
+            summary = json.loads(Path(str(result) + '.profiles.jsonl').read_text())
+            self.assertTrue(summary['all_moves_equal'])
+            self.assertLessEqual(sum(summary['deadends_by_ply']), summary['nodes'])
+            rows = [json.loads(x) for x in result.read_text().splitlines()]
+            self.assertTrue(rows)
+            for row in rows:
+                self.assertLess(row['ply_from_root'], 12)
+                self.assertEqual(sum(c[2] for c in row['observed']), row['parent_nodes'])
+                for child in row['observed']:
+                    self.assertIn(child[0], row['legal'])
+                    self.assertGreater(child[3], 0)
+
+    @unittest.skipUnless(os.environ.get('DDS_PROOF_ROOTS'), 'root fixtures not supplied')
     def test_root_only_gate_skips_small_requests_and_never_enters_children(self):
         rows = Path(os.environ['DDS_PROOF_ROOTS']).read_text().splitlines()
         chosen = []
