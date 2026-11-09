@@ -212,4 +212,8 @@ measurements, tests, and report. See the repository's CREDITS.md and LICENSE.
 
 ## Counterfactual ordering follow-up
 
-[Counterfactual study](counterfactual_study.md): promote stock choices 2–4 at a single early encounter and measure the full solve. A 100-root teacher finds 5.38% hindsight node savings within three card plays; the first residual model does not generalize (reserved family +2.21% nodes, +7.42% CPU). Stock DDS remains the default.
+[Counterfactual study](counterfactual_study.md): promote stock choices 2–4 at a single early encounter and measure the full solve. A 100-root teacher finds 5.38% hindsight node savings within three card plays; the eight-training-deal smoke test regressed on its single reserved family (+2.21% nodes, +7.42% CPU), which is insufficient evidence to judge learnability. Stock DDS remains the default.
+
+## Independent-deal scaling
+
+[1,500-deal study](scale1500_study.md) replaces the pilot with a frozen 1,200/150/150 training/validation/test split. The trainer enforces at least 1,000 distinct training deals after deduplication.

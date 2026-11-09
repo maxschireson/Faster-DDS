@@ -6,6 +6,13 @@ best tested **single** change within the first three card plays. A small model
 trained on these interventions does not yet select them reliably: the reserved
 family uses 2.21% more nodes and 7.42% more CPU time. Stock DDS remains the default.
 
+**Scope correction:** eight independent training deals make this a pipeline
+smoke test, not a meaningful learnability experiment. The observed regression
+cannot establish whether a learned correction can improve DDS, whose ordering
+heuristics cover far more bridge patterns. Multiple positions or sampled worlds
+from those eight deals do not supply independent deal diversity. The first
+substantive learning experiment is documented in `scale1500_study.md`.
+
 ## Experimental question
 
 Train a correction to DDS's ordering: given the double-dummy position, current

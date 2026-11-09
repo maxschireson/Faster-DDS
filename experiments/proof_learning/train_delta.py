@@ -6,6 +6,19 @@ import numpy as np
 from pipeline import features, split_families
 
 
+def load_rows(path):
+    """Stream JSON and retain only training fields, avoiding full text copies."""
+    rows=[]
+    with Path(path).open() as source:
+        for line in source:
+            r=json.loads(line)
+            rows.append(dict(family=r['family'],root=r['root'],decision_index=r['decision_index'],
+                key=r['key'],stock_order=r['stock_order'],ply_from_root=r['ply_from_root'],
+                baseline_nodes=r['baseline_nodes'],trials=[dict(rank=t['rank'],nodes=t['nodes'],
+                complete=t['complete']) for t in r['trials']]))
+    return rows
+
+
 def encode(row):
     x = np.zeros(480, np.float32)
     x[:427] = features(row['key'], row['stock_order'])
@@ -81,7 +94,8 @@ def step(model, x, y, mask, complete, weight):
 
 
 def tensors(rows, scale):
-    x = np.stack([encode(r) for r in rows])
+    x = np.empty((len(rows),480),np.float32)
+    for i,r in enumerate(rows):x[i]=encode(r)
     y, mask, complete = (np.zeros((len(rows), 3), np.float32) for _ in range(3))
     for i, row in enumerate(rows):
         for t in row['trials']:
@@ -99,20 +113,24 @@ def main():
     p.add_argument('--splits', help='Frozen manifest containing family_splits')
     p.add_argument('--min-train-families',type=int,default=1)
     args = p.parse_args()
-    rows = [json.loads(x) for x in Path(args.dataset).read_text().splitlines()]
+    rows = load_rows(args.dataset)
     splits = (json.loads(Path(args.splits).read_text())['family_splits'] if args.splits
               else split_families(r['family'] for r in rows))
     groups, deduplication = checked_partition(rows, splits, args.min_train_families)
     scale = np.median([r['baseline_nodes'] for r in groups['train']])
     data = {s: tensors(rs, scale) for s, rs in groups.items()}
+    row_counts={s:len(rs) for s,rs in groups.items()}
+    family_counts={s:len({r['family'] for r in rs}) for s,rs in groups.items()}
+    del rows,groups
     model = initialize(7411); rng = np.random.default_rng(7411)
     history, best, best_w, best_epoch = [], float('inf'), None, 0
     for epoch in range(args.epochs):
-        order = rng.permutation(len(groups['train']))
+        order = rng.permutation(row_counts['train'])
         for i in range(0, len(order), 64):step(model, *(a[order[i:i + 64]] for a in data['train']))
         val = loss_parts(model, *data['validation'])[0]
         history.append(val)
         if val < best:best, best_epoch, best_w = val, epoch + 1, [w.copy() for w in model['w']]
+        if (epoch+1)%10==0:print(json.dumps(dict(epoch=epoch+1,validation_loss=val)),flush=True)
     model['w'] = best_w
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
     with (out / 'delta.txt').open('w') as f:
@@ -121,8 +139,8 @@ def main():
     np.savez(out / 'delta.npz', **{f'w{i}': w for i, w in enumerate(model['w'])})
     report = dict(parameters=sum(w.size for w in model['w']), best_epoch=best_epoch,
                   deduplication=deduplication,
-                  family_splits=splits, rows={s:len(r) for s,r in groups.items()},
-                  independent_families={s:len({r['family'] for r in rs}) for s,rs in groups.items()},
+                  family_splits=splits, rows=row_counts,
+                  independent_families=family_counts,
                   selected_label_loss={s:loss_parts(model,*d)[0] for s,d in data.items()},
                   baseline_label_loss={s:baseline_loss(*d) for s,d in data.items()},
                   validation_history=history,

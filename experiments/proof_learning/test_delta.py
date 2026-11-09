@@ -1,9 +1,26 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 import numpy as np
-from train_delta import encode, initialize, step, predict, partition, baseline_loss, loss_parts, checked_partition
+from train_delta import encode, initialize, step, predict, partition, baseline_loss, loss_parts, checked_partition, load_rows, tensors
 
 
 class DeltaTest(unittest.TestCase):
+    def test_streamed_compact_loader_preserves_targets_and_features(self):
+        key=[0]*26;key[19]=4;key[24]=44
+        row=dict(family='a',root=1,decision_index=2,key=key,stock_order=[1,2],ply_from_root=1,
+                 baseline_nodes=100,trials=[dict(rank=1,nodes=100,complete=True,all_moves_equal=True),
+                 dict(rank=2,nodes=200,complete=False,cpu_seconds=1.23)],unused='large unused metadata')
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'rows';p.write_text(json.dumps(row)+'\n')
+            compact=load_rows(p)
+        self.assertNotIn('unused',compact[0])
+        self.assertNotIn('cpu_seconds',compact[0]['trials'][1])
+        for a,b in zip(tensors([row],100),tensors(compact,100)):
+            np.testing.assert_array_equal(a,b)
+        self.assertEqual(tensors(compact,100)[0].dtype,np.float32)
+
     def test_fixed_family_assignment_survives_subsampling_and_enforces_training_minimum(self):
         rows=[dict(family=f,root=i,decision_index=1,key=[i],stock_order=[1,2]) for i,f in enumerate('abcd')]
         splits=dict(a='test',b='train',c='validation',d='train')
